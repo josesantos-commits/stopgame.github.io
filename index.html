@@ -4,11 +4,11 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <title>¡STOP! — Multijugador</title>
-<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Nunito:wght@400;600;700;800;900&family=Caveat:wght@600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Nunito:wght@400;600;700;800;900&display=swap" rel="stylesheet">
 
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-import { getDatabase, ref, set, get, onValue, update, runTransaction, serverTimestamp, remove }
+import { getDatabase, ref, set, get, onValue, update, push, remove, serverTimestamp }
   from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
 
 const firebaseConfig = {
@@ -24,14 +24,13 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const db  = getDatabase(app);
 
+// ══════════════════════════════════════════════
+//  CONSTANTS
+// ══════════════════════════════════════════════
 const EMOJIS  = ['😎','🦁','🐯','🦊','🐻','🐸','🦄','🐺','🦋','🐙','🦅','🐲'];
-const COLORS  = ['#e63946','#2563eb','#0891b2','#7c3aed','#059669','#dc2626',
-                 '#1d4ed8','#0e7490','#6d28d9','#047857','#be123c','#1e40af'];
-const BASE_LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
-const USE_SPANISH_ENYE = false;
-const LETTERS = USE_SPANISH_ENYE
-  ? [...BASE_LETTERS.slice(0, 14), 'Ñ', ...BASE_LETTERS.slice(14)]
-  : BASE_LETTERS;
+const COLORS  = ['#ff6b35','#ffd166','#06d6a0','#a855f7','#3b82f6','#f472b6',
+                 '#fb923c','#34d399','#60a5fa','#c084fc','#f87171','#facc15'];
+const LETTERS = 'ABCDEFGHIJLMNOPRSTV'.split('');
 const DEFAULT_CATS = [
   {name:'Nombre',icon:'👤'},{name:'País',icon:'🌍'},
   {name:'Animal',icon:'🐾'},{name:'Color',icon:'🎨'},
@@ -41,247 +40,56 @@ const DEFAULT_CATS = [
   {name:'Marca',icon:'🏷️'},{name:'Profesión',icon:'💼'},
 ];
 
-let me = { uid:null, name:'', emoji:'', color:'', isHost:false };
-let roomCode  = '';
-let gameState = null;
-let listeners = [];
-let localAnswers = {};
-let _hostOfflineLeaveTimer = null;
-let _roomExitInProgress = false;
-const STOP_COUNTDOWN_SECONDS = 10;
-
-// ── CUSTOM ALERT/CONFIRM ─────────────────────
-function showCustomAlert(message, type = 'info') {
-  return new Promise(resolve => {
-    const overlay = document.createElement('div');
-    overlay.className = 'modal-overlay';
-    overlay.innerHTML = `
-      <div class="modal-box modal-alert">
-        <div class="modal-icon">${type === 'error' ? '⚠️' : type === 'success' ? '✅' : 'ℹ️'}</div>
-        <div class="modal-msg">${message}</div>
-        <button class="modal-btn modal-btn-primary" id="modal-ok-btn">ACEPTAR</button>
-      </div>`;
-    document.body.appendChild(overlay);
-    requestAnimationFrame(() => overlay.classList.add('modal-visible'));
-    const close = () => {
-      overlay.classList.remove('modal-visible');
-      setTimeout(() => { overlay.remove(); resolve(true); }, 220);
-    };
-    overlay.querySelector('#modal-ok-btn').onclick = close;
-    overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
-  });
-}
-
-function showCustomConfirm(message) {
-  return new Promise(resolve => {
-    const overlay = document.createElement('div');
-    overlay.className = 'modal-overlay';
-    overlay.innerHTML = `
-      <div class="modal-box modal-confirm">
-        <div class="modal-icon">❓</div>
-        <div class="modal-msg">${message}</div>
-        <div class="modal-btns">
-          <button class="modal-btn modal-btn-secondary" id="modal-cancel-btn">CANCELAR</button>
-          <button class="modal-btn modal-btn-primary" id="modal-ok-btn">CONFIRMAR</button>
-        </div>
-      </div>`;
-    document.body.appendChild(overlay);
-    requestAnimationFrame(() => overlay.classList.add('modal-visible'));
-    const close = (val) => {
-      overlay.classList.remove('modal-visible');
-      setTimeout(() => { overlay.remove(); resolve(val); }, 220);
-    };
-    overlay.querySelector('#modal-ok-btn').onclick = () => close(true);
-    overlay.querySelector('#modal-cancel-btn').onclick = () => close(false);
-    overlay.addEventListener('click', e => { if (e.target === overlay) close(false); });
-  });
-}
-
-// Override native alert/confirm
-window._customAlert   = showCustomAlert;
-window._customConfirm = showCustomConfirm;
-
-// ── SESSION PERSISTENCE ───────────────────────
-function saveSession() {
-  localStorage.setItem('stop_session', JSON.stringify({ uid: me.uid, name: me.name, emoji: me.emoji, color: me.color, isHost: me.isHost, roomCode }));
-}
-function clearSession() {
-  localStorage.removeItem('stop_session');
-}
-function clearRoomListeners() {
-  listeners.forEach(unsub => {
-    try { unsub(); } catch (_) {}
-  });
-  listeners = [];
-}
-function clearHostOfflineLeaveTimer() {
-  if (_hostOfflineLeaveTimer) {
-    clearTimeout(_hostOfflineLeaveTimer);
-    _hostOfflineLeaveTimer = null;
-  }
-}
-function scheduleHostOfflineLeave() {
-  if (me.isHost || _hostOfflineLeaveTimer) return;
-  _hostOfflineLeaveTimer = setTimeout(() => {
-    _hostOfflineLeaveTimer = null;
-    goToLobbyAfterRoomExit(t('hostDisconnected'));
-  }, 8000);
-}
-function resetRoundRuntimeState() {
-  _lastRenderedRound = null;
-  _savedForRound = null;
-  _nextRoundBusy = false;
-  _stopRequestInFlight = false;
-  _stopFinalizeInFlight = false;
-  localAnswers = {};
-  clearStopCountdownTicker();
-}
-function resetRoomContext() {
-  clearRoomListeners();
-  clearHostOfflineLeaveTimer();
-  resetRoundRuntimeState();
-  gameState = null;
-  roomCode = '';
-  me.uid = null;
-  me.isHost = false;
-  // NOTE: do NOT reset _roomExitInProgress here — it must stay true until
-  // the player deliberately starts a new session (subscribeRoom resets it)
-  clearSession();
-}
-function goToLobbyAfterRoomExit(message) {
-  if (_roomExitInProgress) return;
-  _roomExitInProgress = true;
-  const playerName = me.name; // save before reset
-  const playerEmoji = me.emoji;
-  const playerColor = me.color;
-  resetRoomContext();
-  // Restore identity so they can play again without re-logging in
-  me.name = playerName; me.emoji = playerEmoji; me.color = playerColor;
-  showScreen('screen-lobby-choice');
-  updateLeaveButtons();
-  // Update the user pill
-  const pill = document.getElementById('lobby-user-pill');
-  if (pill && me.name) pill.innerHTML = `<span>${me.emoji}</span> ${me.name}`;
-  // Re-apply language so all lobby buttons show correctly
-  if (typeof applyLang === 'function') applyLang();
-  if (message) showCustomAlert(message);
-}
-function updateLeaveButtons() {
-  document.querySelectorAll('[data-leave-room-btn]').forEach(btn => {
-    const label = me.isHost ? 'Cerrar sala' : 'Salir de sala';
-    btn.setAttribute('aria-label', label);
-    btn.setAttribute('title', label);
-  });
-}
-function setMyOnlineStatus(online) {
-  if (!roomCode || !me.uid) return;
-  update(ref(db, `rooms/${roomCode}/players/${me.uid}`), { online }).catch(() => {});
-}
-async function tryRestoreSession() {
-  const raw = localStorage.getItem('stop_session');
-  if (!raw) return false;
-  try {
-    const s = JSON.parse(raw);
-    if (!s.uid || !s.roomCode) return false;
-
-    // Always restore player identity even if room is gone
-    if (s.name) {
-      me.name = s.name; me.emoji = s.emoji || me.emoji;
-      me.color = s.color || me.color;
-    }
-
-    const snap = await get(ref(db, `rooms/${s.roomCode}`));
-    if (!snap.exists()) { clearSession(); return false; }
-    const data = snap.val();
-    if (data.status === 'ended') { clearSession(); return false; }
-    if (!data.host || !data.players?.[data.host]) { clearSession(); return false; }
-    if (!data.players?.[s.uid]) { clearSession(); return false; }
-    // Room and player are valid — proceed with full restore
-    me.uid = s.uid; me.name = s.name; me.emoji = s.emoji;
-    me.color = s.color; me.isHost = s.isHost || (data.host === s.uid);
-    updateLeaveButtons();
-    roomCode = s.roomCode;
-    await update(ref(db, `rooms/${roomCode}/players/${me.uid}`), {
-      online: true,
-      name: me.name,
-      emoji: me.emoji,
-      color: me.color,
-    });
-    saveSession();
-    subscribeRoom();
-    return true;
-  } catch(e) { clearSession(); return false; }
-}
-
-window.leaveRoom = async function(opts = {}) {
-  const currentRoom = roomCode;
-  const currentUid = me.uid;
-  const isHost = me.isHost;
-  if (!currentRoom || !currentUid) {
-    goToLobbyAfterRoomExit();
-    return;
-  }
-
-  const endRoom = opts.endRoom ?? isHost;
-  const confirmMsg = endRoom
-    ? t('confirmLeaveHost')
-    : t('confirmLeaveGuest');
-  if (!opts.skipConfirm) {
-    const ok = await showCustomConfirm(confirmMsg);
-    if (!ok) return;
-  }
-
-  try {
-    if (endRoom) {
-      await update(ref(db, `rooms/${currentRoom}`), {
-        status: 'ended',
-        endedBy: currentUid,
-        endedAt: Date.now(),
-      });
-      await remove(ref(db, `rooms/${currentRoom}`));
-      goToLobbyAfterRoomExit();
-      return;
-    }
-
-    await remove(ref(db, `rooms/${currentRoom}/players/${currentUid}`));
-    goToLobbyAfterRoomExit();
-  } catch (e) {
-    console.error('leaveRoom error:', e);
-    goToLobbyAfterRoomExit('Saliste localmente, pero hubo un error al sincronizar la salida.');
-  }
+// ══════════════════════════════════════════════
+//  LOCAL STATE
+// ══════════════════════════════════════════════
+let me = {
+  uid: null,
+  name: '',
+  emoji: '',
+  color: '',
+  isHost: false,
 };
+let roomCode   = '';
+let gameState  = null;
+let listeners  = [];
+let scoringDone = false; // track if we already submitted scores to firebase
 
-// ── SCREEN ROUTER ────────────────────────────
+// ══════════════════════════════════════════════
+//  SCREEN ROUTER
+// ══════════════════════════════════════════════
 function showScreen(id) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   document.getElementById(id).classList.add('active');
+  window.scrollTo({top:0, behavior:'smooth'});
 }
-function scrollTop() { window.scrollTo({ top: 0, behavior: 'smooth' }); }
 
-// ── LOGIN ─────────────────────────────────────
+// ══════════════════════════════════════════════
+//  SCREEN: LOGIN
+// ══════════════════════════════════════════════
 function initLogin() {
   showScreen('screen-login');
   const savedName = localStorage.getItem('stop_name') || '';
   if (savedName) document.getElementById('inp-name').value = savedName;
   const idx = Math.floor(Math.random() * EMOJIS.length);
-  me.emoji = EMOJIS[idx]; me.color = COLORS[idx];
-  const loginEl = document.getElementById('login-emoji');
-  loginEl.textContent = me.emoji;
-  loginEl.style.background = me.color + '18';
-  loginEl.style.border = `3px solid ${me.color}`;
+  me.emoji = EMOJIS[idx];
+  me.color = COLORS[idx];
+  document.getElementById('login-emoji').textContent = me.emoji;
+  document.getElementById('login-emoji').style.background = me.color + '33';
+  document.getElementById('login-emoji').style.border = `2px solid ${me.color}`;
+
   const picker = document.getElementById('emoji-picker');
   picker.innerHTML = '';
   EMOJIS.forEach((e, i) => {
     const btn = document.createElement('button');
     btn.className = 'emoji-opt';
     btn.textContent = e;
-    btn.style.background = COLORS[i] + '15';
-    btn.style.borderColor = COLORS[i] + '50';
+    btn.style.background = COLORS[i] + '22';
     btn.onclick = () => {
       me.emoji = e; me.color = COLORS[i];
-      loginEl.textContent = e;
-      loginEl.style.background = COLORS[i]+'18';
-      loginEl.style.border = `3px solid ${COLORS[i]}`;
+      document.getElementById('login-emoji').textContent = e;
+      document.getElementById('login-emoji').style.background = COLORS[i]+'33';
+      document.getElementById('login-emoji').style.border = `2px solid ${COLORS[i]}`;
       document.querySelectorAll('.emoji-opt').forEach(b => b.classList.remove('sel'));
       btn.classList.add('sel');
     };
@@ -295,35 +103,26 @@ window.loginContinue = function() {
   me.name = name;
   localStorage.setItem('stop_name', name);
   showScreen('screen-lobby-choice');
-  updateLeaveButtons();
-  window.scrollTo({ top: 0, behavior: 'smooth' });
 };
 
-// ── LOBBY ──────────────────────────────────────
-window.goCreateRoom = function() {
-  _roomExitInProgress = false;
-  const btn = document.getElementById('btn-create-room');
-  if (btn) {
-    btn.disabled = false;
-    btn.textContent = t('createBtn');
-    btn.onclick = window.createRoom;
-  }
-  showScreen('screen-create'); initCreate();
-};
+// ══════════════════════════════════════════════
+//  SCREEN: LOBBY CHOICE
+// ══════════════════════════════════════════════
+window.goCreateRoom = function() { showScreen('screen-create'); initCreate(); };
 window.goJoinRoom   = function() { showScreen('screen-join'); };
-window.backToChoice = function() {
-  const btn = document.getElementById('btn-create-room');
-  if (btn) { btn.disabled = false; btn.textContent = t('createBtn'); }
-  showScreen('screen-lobby-choice'); updateLeaveButtons();
-};
-window.backToLogin  = function() { showScreen('screen-login'); initLogin(); };
+window.backToChoice = function() { showScreen('screen-lobby-choice'); };
 
 function initCreate() {
+  const grid = document.getElementById('create-cat-grid');
+  grid.innerHTML = '';
   window._createCats = DEFAULT_CATS.map((c,i) => ({...c, selected: i < 6}));
   renderCreateCats();
-  document.querySelectorAll('.round-opt').forEach(b => b.classList.toggle('sel', b.dataset.n === '3'));
+  document.querySelectorAll('.round-opt').forEach(b => {
+    b.classList.toggle('sel', b.dataset.n === '3');
+  });
   window._createRounds = 3;
 }
+
 function renderCreateCats() {
   const grid = document.getElementById('create-cat-grid');
   grid.innerHTML = '';
@@ -331,142 +130,144 @@ function renderCreateCats() {
     const ch = document.createElement('div');
     ch.className = 'cat-chip' + (c.selected ? ' sel' : '');
     ch.innerHTML = `${c.icon} ${c.name} <span class="chk">✓</span>`;
-    ch.onclick = () => { window._createCats[i].selected = !window._createCats[i].selected; ch.classList.toggle('sel'); };
+    ch.onclick = () => {
+      window._createCats[i].selected = !window._createCats[i].selected;
+      ch.classList.toggle('sel');
+    };
     grid.appendChild(ch);
   });
 }
+
 window.addCustomCatCreate = function() {
   const inp = document.getElementById('inp-custom-cat');
-  const v = inp.value.trim(); if (!v) return;
-  window._createCats.push({name:v, icon:'⭐', selected:true});
-  inp.value = ''; renderCreateCats();
+  const v = inp.value.trim();
+  if (!v) return;
+  window._createCats.push({name: v, icon: '⭐', selected: true});
+  inp.value = '';
+  renderCreateCats();
 };
+
 window.selectRounds = function(n, btn) {
   window._createRounds = n;
   document.querySelectorAll('.round-opt').forEach(b => b.classList.remove('sel'));
   btn.classList.add('sel');
 };
+
 window.createRoom = async function() {
   const cats = window._createCats.filter(c => c.selected);
-  if (cats.length < 2) { showCustomAlert(t('minCats'), 'error'); return; }
+  if (cats.length < 2) { alert('Elige al menos 2 categorías'); return; }
+
   const btn = document.getElementById('btn-create-room');
-  btn.disabled = true; btn.textContent = t('creatingRoom');
-  try {
-    roomCode = generateCode();
-    me.uid = 'p_' + Math.random().toString(36).slice(2,8);
-    me.isHost = true;
-    await set(ref(db, `rooms/${roomCode}`), {
-      host: me.uid, status: 'waiting',
-      settings: { categories: cats, totalRounds: window._createRounds },
-      currentRound: 0, currentLetter: '', usedLetters: [], letterBag: buildShuffledLetterBag(), letterCursor: -1,
-      players: { [me.uid]: { name:me.name, emoji:me.emoji, color:me.color, totalScore:0, online:true, ready:false } },
-      answers: {}, roundScores: {}, stoppedBy: null, stopCountdownEndsAt: null, createdAt: serverTimestamp(),
-    });
-    subscribeRoom();
-    showScreen('screen-waiting');
-    renderWaitingRoom();
-    updateLeaveButtons();
-    saveSession();
-  } catch(e) {
-    console.error('createRoom error:', e);
-    btn.disabled = false; btn.textContent = t('createBtn');
-  }
+  btn.disabled = true; btn.textContent = 'Creando sala...';
+
+  roomCode = generateCode();
+  const roomRef = ref(db, `rooms/${roomCode}`);
+
+  me.uid = 'p_' + Math.random().toString(36).slice(2,8);
+  me.isHost = true;
+
+  const roomData = {
+    host: me.uid,
+    status: 'waiting',
+    settings: {
+      categories: cats,
+      totalRounds: window._createRounds,
+    },
+    currentRound: 0,
+    currentLetter: '',
+    usedLetters: [],
+    players: {
+      [me.uid]: {
+        name: me.name, emoji: me.emoji, color: me.color,
+        totalScore: 0, online: true, ready: false,
+      }
+    },
+    answers: {},
+    roundScores: {},
+    stoppedBy: null,
+    createdAt: serverTimestamp(),
+  };
+
+  await set(roomRef, roomData);
+  subscribeRoom();
+  showScreen('screen-waiting');
+  renderWaitingRoom();
 };
 
-// ── JOIN ──────────────────────────────────────
+// ══════════════════════════════════════════════
+//  JOIN ROOM
+// ══════════════════════════════════════════════
 window.joinRoom = async function() {
-  _roomExitInProgress = false;
   const code = document.getElementById('inp-room-code').value.trim().toUpperCase();
   if (code.length < 4) { shake('inp-room-code'); return; }
+
   const btn = document.getElementById('btn-join');
-  btn.disabled = true; btn.textContent = t('searching');
+  btn.disabled = true; btn.textContent = 'Buscando...';
+
   roomCode = code;
-  try {
-    const snap = await get(ref(db, `rooms/${roomCode}`));
-    if (!snap.exists()) { btn.disabled=false; btn.textContent=t('joinBtn'); showCustomAlert(t('roomNotFound'), 'error'); return; }
-    const data = snap.val();
+  const snap = await get(ref(db, `rooms/${roomCode}`));
 
-    // Check if player has a saved session for this room (rejoin)
-    const savedRaw = localStorage.getItem('stop_session');
-    const savedSession = savedRaw ? JSON.parse(savedRaw) : null;
-    const isRejoin = savedSession && savedSession.roomCode === code && savedSession.uid && data.players?.[savedSession.uid];
-
-    if (isRejoin) {
-      // Restore previous identity and rejoin
-      me.uid = savedSession.uid;
-      me.name = savedSession.name || me.name;
-      me.emoji = savedSession.emoji || me.emoji;
-      me.color = savedSession.color || me.color;
-      me.isHost = data.host === me.uid;
-      await update(ref(db, `rooms/${roomCode}/players/${me.uid}`), { online: true, name: me.name, emoji: me.emoji, color: me.color });
-      subscribeRoom();
-      showScreen('screen-waiting');
-      updateLeaveButtons();
-      saveSession();
-      return;
-    }
-
-    if (data.status !== 'waiting') { btn.disabled=false; btn.textContent=t('joinBtn'); showCustomAlert(t('gameStarted'), 'error'); return; }
-    me.uid = 'p_' + Math.random().toString(36).slice(2,8);
-    me.isHost = false;
-    await update(ref(db, `rooms/${roomCode}/players/${me.uid}`), { name:me.name, emoji:me.emoji, color:me.color, totalScore:0, online:true, ready:false });
-    subscribeRoom();
-    showScreen('screen-waiting');
-    updateLeaveButtons();
-    saveSession();
-  } catch(e) {
-    console.error('joinRoom error:', e);
-    btn.disabled=false; btn.textContent=t('joinBtn');
-    showCustomAlert(t('joinError'), 'error');
+  if (!snap.exists()) {
+    btn.disabled = false; btn.textContent = 'UNIRSE →';
+    alert('Sala no encontrada. Verifica el código.');
+    return;
   }
+
+  const data = snap.val();
+  if (data.status !== 'waiting') {
+    btn.disabled = false; btn.textContent = 'UNIRSE →';
+    alert('El juego ya comenzó. No puedes unirte ahora.');
+    return;
+  }
+
+  me.uid = 'p_' + Math.random().toString(36).slice(2,8);
+  me.isHost = false;
+
+  await update(ref(db, `rooms/${roomCode}/players/${me.uid}`), {
+    name: me.name, emoji: me.emoji, color: me.color,
+    totalScore: 0, online: true, ready: false,
+  });
+
+  subscribeRoom();
+  showScreen('screen-waiting');
 };
 
-// ── FIREBASE SUBSCRIPTION ─────────────────────
+// ══════════════════════════════════════════════
+//  FIREBASE SUBSCRIPTION
+// ══════════════════════════════════════════════
 function subscribeRoom() {
-  _roomExitInProgress = false;
-  const capturedRoomCode = roomCode;
-  const unsub = onValue(ref(db, `rooms/${roomCode}`), snap => {
-    // If this listener fires after we already left, ignore it
-    if (roomCode !== capturedRoomCode) return;
-    if (!snap.exists()) {
-      goToLobbyAfterRoomExit(t('roomNotExist'));
-      return;
-    }
-    const room = snap.val();
-    if (room.status === 'ended') {
-      goToLobbyAfterRoomExit(t('roomClosed'));
-      return;
-    }
-    if (!room.host || !room.players?.[room.host]) {
-      goToLobbyAfterRoomExit(t('roomNoHost'));
-      return;
-    }
-    if (!room.players?.[me.uid]) {
-      goToLobbyAfterRoomExit(t('roomKicked'));
-      return;
-    }
-
-    const hostPlayer = room.players?.[room.host] || null;
-    if (!me.isHost && hostPlayer && hostPlayer.online === false) {
-      scheduleHostOfflineLeave();
-    } else {
-      clearHostOfflineLeaveTimer();
-    }
-
-    gameState = ensureLetterCycleState(room);
-    saveSession();
+  const roomRef = ref(db, `rooms/${roomCode}`);
+  const unsub = onValue(roomRef, snap => {
+    if (!snap.exists()) return;
+    gameState = snap.val();
     handleStateChange();
   });
   listeners.push(unsub);
 }
 
-// ══════════════════════════════════════════════════════
-//  STATE HANDLER
+function handleStateChange() {
+  if (!gameState) return;
+  switch (gameState.status) {
+    case 'waiting':  renderWaitingRoom(); break;
+    case 'letter':   renderLetterReveal(); break;
+    case 'playing':  renderPlayingScreen(); break;
+    case 'scoring':  renderScoringScreen(); break;
+    case 'results':  renderResultsScreen(); break;
+  }
+}
+
+// ══════════════════════════════════════════════
+//  WAITING ROOM
+// ══════════════════════════════════════════════
 function renderWaitingRoom() {
-  if (!document.getElementById('screen-waiting').classList.contains('active')) { showScreen('screen-waiting'); scrollTop(); }
+  if (!document.getElementById('screen-waiting').classList.contains('active')) {
+    showScreen('screen-waiting');
+  }
+
   document.getElementById('room-code-display').textContent = roomCode;
   document.getElementById('room-round-info').textContent =
-    `${gameState.settings?.totalRounds||3} rondas · ${(gameState.settings?.categories||[]).length} categorías`;
+    `${gameState.settings?.totalRounds || 3} rondas · ${(gameState.settings?.categories || []).length} categorías`;
+
   const players = Object.entries(gameState.players || {});
   const list = document.getElementById('waiting-players');
   list.innerHTML = '';
@@ -474,39 +275,57 @@ function renderWaitingRoom() {
     const li = document.createElement('div');
     li.className = 'waiting-player' + (uid === me.uid ? ' me' : '');
     li.innerHTML = `
-      <div class="w-avatar" style="background:${p.color}18;border:2px solid ${p.color}">${p.emoji}</div>
-      <div class="w-name">${p.name}${uid===me.uid?` <span class="you-tag">${t('youTag')}</span>`:''}</div>
-      ${uid===gameState.host?`<div class="host-badge">${t('hostBadge')}</div>`:''}`;
+      <div class="w-avatar" style="background:${p.color}22;border:2px solid ${p.color}">${p.emoji}</div>
+      <div class="w-name">${p.name}${uid === me.uid ? ' <span style="color:var(--muted);font-size:11px;">(tú)</span>' : ''}</div>
+      ${uid === gameState.host ? '<div class="host-badge">👑 Host</div>' : ''}
+    `;
     list.appendChild(li);
   });
+
   const startBtn = document.getElementById('btn-start-game');
   startBtn.style.display = me.isHost ? 'block' : 'none';
   startBtn.disabled = players.length < 2;
+
   document.getElementById('waiting-hint').style.display = me.isHost ? 'none' : 'block';
 }
+
 window.startGameFromHost = async function() {
   if (!me.isHost) return;
-  const nextLetterState = getNextLetterState(gameState || {});
+  const letter = pickLetter([]);
+
   await update(ref(db, `rooms/${roomCode}`), {
-    status:'letter', currentRound:1, currentLetter:nextLetterState.letter,
-    usedLetters:nextLetterState.usedLetters,
-    letterBag:nextLetterState.letterBag,
-    letterCursor:nextLetterState.letterCursor,
-    stoppedBy:null, stopCountdownEndsAt:null, answers:buildEmptyAnswers(),
+    status: 'letter',
+    currentRound: 1,
+    currentLetter: letter,
+    usedLetters: [letter],
+    stoppedBy: null,
+    answers: buildEmptyAnswers(),
   });
 };
+
 function buildEmptyAnswers() {
   const cats = gameState.settings.categories;
+  const players = Object.keys(gameState.players);
   const ans = {};
-  Object.keys(gameState.players).forEach(uid => { ans[uid]={}; cats.forEach((_,ci) => ans[uid][ci]=''); });
+  players.forEach(uid => {
+    ans[uid] = {};
+    cats.forEach((_, ci) => { ans[uid][ci] = ''; });
+  });
   return ans;
 }
 
-// ── LETTER REVEAL ─────────────────────────────
+// ══════════════════════════════════════════════
+//  LETTER REVEAL
+// ══════════════════════════════════════════════
 function renderLetterReveal() {
-  if (!document.getElementById('screen-letter').classList.contains('active')) { showScreen('screen-letter'); scrollTop(); }
+  if (!document.getElementById('screen-letter').classList.contains('active')) {
+    showScreen('screen-letter');
+  }
+
   document.getElementById('reveal-letter').textContent = gameState.currentLetter;
-  document.getElementById('reveal-round-lbl').textContent = `${t("roundLabel").toUpperCase()} ${gameState.currentRound} ${t("roundOf").toUpperCase()} ${gameState.settings.totalRounds}`;
+  document.getElementById('reveal-round-lbl').textContent =
+    `RONDA ${gameState.currentRound} DE ${gameState.settings.totalRounds}`;
+
   const catWrap = document.getElementById('reveal-cat-pills');
   catWrap.innerHTML = '';
   gameState.settings.categories.forEach(c => {
@@ -515,13 +334,20 @@ function renderLetterReveal() {
     pill.textContent = `${c.icon} ${c.name}`;
     catWrap.appendChild(pill);
   });
-  const btn = document.getElementById('btn-ready');
-  if (btn) { btn.disabled = false; btn.textContent = '¡ESTOY LISTO! →'; }
+
+  // Auto-scroll to ready button on mobile
+  setTimeout(() => {
+    const btn = document.getElementById('btn-ready');
+    if (btn) btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, 700);
 }
+
 window.readyToPlay = async function() {
   const btn = document.getElementById('btn-ready');
   if (btn) { btn.disabled = true; btn.textContent = '⏳ Esperando...'; }
-  await update(ref(db, `rooms/${roomCode}/players/${me.uid}`), { ready:true });
+
+  await update(ref(db, `rooms/${roomCode}/players/${me.uid}`), { ready: true });
+
   const snap = await get(ref(db, `rooms/${roomCode}/players`));
   const players = snap.val();
   const allReady = Object.values(players).every(p => p.ready);
@@ -533,72 +359,50 @@ window.readyToPlay = async function() {
   }
 };
 
-// ── PLAYING SCREEN ────────────────────────────
-let _lastRenderedRound = null;
-let _stopCountdownInterval = null;
-let _stopFinalizeInFlight = false;
-let _stopRequestInFlight = false;
+// ══════════════════════════════════════════════
+//  PLAYING SCREEN
+// ══════════════════════════════════════════════
+let localAnswers = {};
+let playingRendered = false;
 
 function renderPlayingScreen() {
-  if (!document.getElementById('screen-playing').classList.contains('active')) {
+  const wasPlaying = document.getElementById('screen-playing').classList.contains('active');
+  if (!wasPlaying) {
     showScreen('screen-playing');
-  }
-
-  const isNewRound = gameState.currentRound !== _lastRenderedRound;
-
-  if (isNewRound) {
-    _lastRenderedRound = gameState.currentRound;
+    playingRendered = false;
     localAnswers = {};
-    _stopRequestInFlight = false;
-    _stopFinalizeInFlight = false;
-    clearStopCountdownTicker();
-
-    const stopBtn = document.getElementById('btn-stop');
-    const banner  = document.getElementById('stop-banner');
-    stopBtn.disabled = false;
-    stopBtn.style.display = '';
-    stopBtn.textContent = '🛑 ¡STOP!';
-    banner.style.display = 'none';
-
     renderMyBoard();
-
+    // Auto-scroll to board on mobile
     setTimeout(() => {
-      const board = document.getElementById('board-wrap');
+      const board = document.getElementById('my-board-rows');
       if (board) board.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    }, 500);
+    }, 400);
   }
 
   document.getElementById('play-letter').textContent = gameState.currentLetter;
-  document.getElementById('play-round').textContent  =
+  document.getElementById('play-round').textContent =
     `${gameState.currentRound} / ${gameState.settings.totalRounds}`;
 
-  const rcEl = document.getElementById('play-room-code');
-  if (rcEl) rcEl.textContent = roomCode;
-
+  // Show my accumulated score
   const myScore = gameState.players?.[me.uid]?.totalScore || 0;
   const scoreEl = document.getElementById('my-score-display');
-  if (scoreEl) scoreEl.textContent = myScore.toLocaleString();
+  if (scoreEl) scoreEl.textContent = myScore + ' pts';
 
   renderPlayerStatus();
 
-  const stopBtn = document.getElementById('btn-stop');
-
-  if (gameState.stoppedBy) {
+  // If someone called STOP — keep answers but disable inputs
+  if (gameState.stoppedBy && gameState.status === 'playing') {
+    const stopper = gameState.players[gameState.stoppedBy];
     document.getElementById('stop-banner').style.display = 'flex';
-    updateStopBannerCountdown();
-    stopBtn.disabled = true;
-    stopBtn.style.display = 'none';
-    ensureStopCountdownTicker();
-    maybeFinalizeStopCountdown();
-  } else {
-    clearStopCountdownTicker();
-    document.getElementById('stop-banner').style.display = 'none';
-    stopBtn.disabled = false;
-    stopBtn.style.display = '';
-    stopBtn.textContent = '🛑 ¡STOP!';
-    document.querySelectorAll('.ans-input').forEach(i => { i.disabled = false; });
+    document.getElementById('stop-banner-name').textContent =
+      stopper ? `${stopper.emoji} ${stopper.name} llamó ¡STOP!` : '¡STOP!';
+    // Disable inputs but KEEP values
+    document.querySelectorAll('.ans-input').forEach(i => i.disabled = true);
+    document.getElementById('btn-stop').style.display = 'none';
+    document.getElementById('btn-submit').style.display = 'none';
   }
 }
+
 function renderMyBoard() {
   const letter = gameState.currentLetter;
   const cats   = gameState.settings.categories;
@@ -606,18 +410,21 @@ function renderMyBoard() {
   rows.innerHTML = '';
   document.getElementById('board-me-name').textContent = me.name;
   document.getElementById('board-me-emoji').textContent = me.emoji;
-  document.getElementById('board-me-emoji').style.background = me.color + '18';
+  document.getElementById('board-me-emoji').style.background = me.color + '22';
   document.getElementById('board-me-emoji').style.border = `2px solid ${me.color}`;
+
   cats.forEach((cat, ci) => {
-    const saved = gameState.answers?.[me.uid]?.[ci] || localAnswers[ci] || '';
+    const saved = (gameState.answers?.[me.uid]?.[ci]) || localAnswers[ci] || '';
     const row = document.createElement('div');
     row.className = 'board-row';
     row.innerHTML = `
-      <div class="board-cat">${cat.icon}<span>${cat.name}</span></div>
+      <div class="board-cat">${cat.icon} ${cat.name}</div>
       <input class="ans-input" id="ans-${ci}" type="text"
         value="${saved}" placeholder="${letter.toLowerCase()}..."
-        maxlength="40" autocomplete="off" autocorrect="off" spellcheck="false">`;
+        maxlength="40" autocomplete="off" autocorrect="off" spellcheck="false">
+    `;
     rows.appendChild(row);
+
     const inp = row.querySelector('input');
     inp.oninput = () => {
       localAnswers[ci] = inp.value.trim();
@@ -625,1364 +432,980 @@ function renderMyBoard() {
       inp.classList.toggle('valid',   v && v[0].toUpperCase() === letter);
       inp.classList.toggle('invalid', v && v[0].toUpperCase() !== letter);
     };
-    if (saved) inp.classList.toggle('valid', saved[0]?.toUpperCase() === letter);
+    if (saved) {
+      inp.classList.toggle('valid', saved[0]?.toUpperCase() === letter);
+    }
   });
+
   const first = document.querySelector('.ans-input');
   if (first) setTimeout(() => first.focus(), 300);
 }
+
 function renderPlayerStatus() {
   const bar = document.getElementById('players-status-bar');
   bar.innerHTML = '';
   Object.entries(gameState.players || {}).forEach(([uid, p]) => {
     const dot = document.createElement('div');
     dot.className = 'player-dot' + (uid === me.uid ? ' me' : '');
-    dot.style.borderColor = p.color;
-    dot.innerHTML = `<span class="dot-emoji">${p.emoji}</span><span class="dot-name">${p.name.split(' ')[0]}</span><span class="dot-score" style="color:${p.color}">${(p.totalScore||0).toLocaleString()}</span>`;
+    dot.style.background = p.color + '22';
+    dot.style.border = `2px solid ${p.color}`;
+    dot.innerHTML = `<span>${p.emoji}</span><span class="dot-name">${p.name.split(' ')[0]}</span><span class="dot-score">${p.totalScore || 0}</span>`;
     bar.appendChild(dot);
   });
 }
 
 window.callStop = async function() {
-  const btn = document.getElementById('btn-stop');
-  if (btn.disabled || _stopRequestInFlight || gameState.stoppedBy) return;
+  // Save answers FIRST before signaling stop
+  await saveMyAnswers();
+  await update(ref(db, `rooms/${roomCode}`), { stoppedBy: me.uid });
+  document.getElementById('btn-stop').style.display = 'none';
 
-  const confirmStop = await showCustomConfirm(t('confirmStop'));
-  if (!confirmStop) return;
-
-  _stopRequestInFlight = true;
-  btn.disabled = true;
-  btn.textContent = t('stopSending');
-
-  try {
-    await saveMyAnswers();
-
-    const countdownEndsAt = Date.now() + (STOP_COUNTDOWN_SECONDS * 1000);
-    const tx = await runTransaction(ref(db, `rooms/${roomCode}`), room => {
-      if (!room || room.status !== 'playing' || room.stoppedBy) return room;
-      room.stoppedBy = me.uid;
-      room.stopCountdownEndsAt = countdownEndsAt;
-      room.answersSaved = room.answersSaved || {};
-      room.answersSaved[me.uid] = true;
-      return room;
-    }, { applyLocally: false });
-
-    if (!tx.committed) {
-      btn.textContent = t('stopActive');
-    }
-  } finally {
-    _stopRequestInFlight = false;
+  if (me.isHost) {
+    setTimeout(async () => {
+      // Save ALL players' current answers before moving to scoring
+      await update(ref(db, `rooms/${roomCode}`), { status: 'scoring' });
+    }, 2500);
   }
 };
 
-function getStopDeadlineMs() {
-  const raw = gameState?.stopCountdownEndsAt;
-  const n = Number(raw || 0);
-  return Number.isFinite(n) ? n : 0;
-}
-
-function clearStopCountdownTicker() {
-  if (_stopCountdownInterval) {
-    clearInterval(_stopCountdownInterval);
-    _stopCountdownInterval = null;
-  }
-}
-
-function updateStopBannerCountdown() {
-  if (!gameState?.stoppedBy) return;
-  const stopper = gameState.players?.[gameState.stoppedBy];
-  const endsAt = getStopDeadlineMs();
-  const remaining = endsAt
-    ? Math.max(0, Math.ceil((endsAt - Date.now()) / 1000))
-    : 0;
-  const countdownText = remaining > 0
-    ? ` ${t('closingIn')}${remaining}s`
-    : t('closingRound');
-  document.getElementById('stop-banner-name').textContent =
-    stopper
-      ? `${stopper.emoji} ${stopper.name} llamó ¡STOP!${countdownText}`
-      : `¡STOP!${countdownText}`;
-}
-
-function ensureStopCountdownTicker() {
-  if (_stopCountdownInterval) return;
-  _stopCountdownInterval = setInterval(() => {
-    if (!gameState || gameState.status !== 'playing' || !gameState.stoppedBy) {
-      clearStopCountdownTicker();
-      return;
-    }
-    updateStopBannerCountdown();
-    maybeFinalizeStopCountdown();
-  }, 250);
-}
-
-async function maybeFinalizeStopCountdown() {
-  if (_stopFinalizeInFlight || !gameState?.stoppedBy || gameState.status !== 'playing') return;
-  const endsAt = getStopDeadlineMs();
-  if (!endsAt || Date.now() < endsAt) return;
-
-  _stopFinalizeInFlight = true;
-  try {
-    await runTransaction(ref(db, `rooms/${roomCode}`), room => {
-      if (!room || room.status !== 'playing' || !room.stoppedBy) return room;
-      const deadline = Number(room.stopCountdownEndsAt || 0);
-      if (!deadline || Date.now() < deadline) return room;
-      room.status = 'scoring';
-      return room;
-    }, { applyLocally: false });
-  } finally {
-    _stopFinalizeInFlight = false;
-  }
-}
-
 async function saveMyAnswers() {
-  const cats = gameState.settings?.categories || [];
+  const cats = gameState.settings.categories;
   const updates = {};
   cats.forEach((_, ci) => {
     const inp = document.getElementById(`ans-${ci}`);
-    updates[`answers/${me.uid}/${ci}`] = inp ? inp.value.trim() : (localAnswers[ci] || '');
+    const val = inp ? inp.value.trim() : (localAnswers[ci] || '');
+    updates[`answers/${me.uid}/${ci}`] = val;
   });
   await update(ref(db, `rooms/${roomCode}`), updates);
 }
 
-// ══════════════════════════════════════════════════════
-//  STATE HANDLER
-// ══════════════════════════════════════════════════════
-let _savedForRound = null;
+window.submitAnswers = async function() {
+  await saveMyAnswers();
+  document.getElementById('btn-submit').textContent = '✓ Guardado';
+  document.getElementById('btn-submit').disabled = true;
+};
 
-function handleStateChange() {
-  if (!gameState) return;
-  // If roomCode was cleared (e.g. after leaveRoom), ignore stale Firebase callbacks
-  if (!roomCode) return;
-  updateLeaveButtons();
-  switch (gameState.status) {
-    case 'waiting':  renderWaitingRoom(); break;
-    case 'letter':   renderLetterReveal(); break;
-    case 'playing':  renderPlayingScreen(); break;
-    case 'scoring': {
-      const round  = gameState.currentRound;
-      const saved  = gameState.answersSaved || {};
-
-      if (_savedForRound !== round && !saved[me.uid]) {
-        _savedForRound = round;
-        const playingActive = document.getElementById('screen-playing').classList.contains('active');
-        if (playingActive) {
-          saveMyAnswers().then(() => {
-            set(ref(db, `rooms/${roomCode}/answersSaved/${me.uid}`), true);
-          });
-        } else {
-          set(ref(db, `rooms/${roomCode}/answersSaved/${me.uid}`), true);
-        }
-        _savedForRound = round;
-      }
-
-      if (me.isHost && !gameState.scoresReady) {
-        const allUids   = Object.keys(gameState.players || {});
-        const allSaved  = allUids.every(uid => saved[uid] === true);
-        if (allSaved) {
-          calcScores();
-        }
-      }
-
-      renderScoringScreen();
-      break;
-    }
-    case 'results':  renderResultsScreen(); break;
-  }
-
-  if (gameState.status !== 'playing') {
-    clearStopCountdownTicker();
-    _stopRequestInFlight = false;
-    _stopFinalizeInFlight = false;
-  }
-}
-
-async function calcScores() {
-  const snap   = await get(ref(db, `rooms/${roomCode}/answers`));
-  const ans    = snap.val() || {};
-  const letter = gameState.currentLetter;
-  const players = Object.entries(gameState.players || {});
-  const cats    = gameState.settings.categories;
-  const scores  = {};
-  players.forEach(([uid]) => { scores[uid] = {}; });
-
-  function norm(s) {
-    return (s || '').trim().toLowerCase()
-      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-      .replace(/\s+/g, ' ');
-  }
-
-  cats.forEach((_, ci) => {
-    const validity = {};
-    players.forEach(([uid]) => {
-      const raw = (ans[uid]?.[ci] || '').trim();
-      validity[uid] = (raw.length >= 2 && raw[0].toUpperCase() === letter) ? norm(raw) : null;
-    });
-
-    const freq = {};
-    players.forEach(([uid]) => {
-      const v = validity[uid];
-      if (v) freq[v] = (freq[v] || 0) + 1;
-    });
-
-    players.forEach(([uid]) => {
-      const v = validity[uid];
-      scores[uid][ci] = !v ? 0 : freq[v] === 1 ? 100 : freq[v] === 2 ? 50 : 25;
-    });
-  });
-
-  await update(ref(db, `rooms/${roomCode}`), { roundScores: scores, scoresReady: true });
-}
-
-// ══════════════════════════════════════════════════════
+// ══════════════════════════════════════════════
 //  SCORING SCREEN
-// ══════════════════════════════════════════════════════
+// Points: 100 unique, 50 shared by 2, 25 shared by 3+
+// The RIVAL corrects points, not yourself
+// ══════════════════════════════════════════════
 function renderScoringScreen() {
   if (!document.getElementById('screen-scoring').classList.contains('active')) {
     showScreen('screen-scoring');
-    scrollTop();
-    document.getElementById('screen-scoring')._scrolled = false;
+    scoringDone = false;
   }
 
   document.getElementById('scoring-round-lbl').textContent =
-    `${t("roundLabel").toUpperCase()} ${gameState.currentRound} ${t("roundOf")} ${gameState.settings.totalRounds} — ${t("scoringTitle")}`;
+    `RONDA ${gameState.currentRound} — PUNTUACIÓN`;
 
-  const subEl   = document.getElementById('scoring-sub');
   const cats    = gameState.settings.categories;
   const players = Object.entries(gameState.players || {});
   const answers = gameState.answers || {};
 
-  if (!gameState.scoresReady) {
-    const allUids    = Object.keys(gameState.players || {});
-    const saved      = gameState.answersSaved || {};
-    const savedCount = allUids.filter(uid => saved[uid]).length;
-    if (subEl) subEl.textContent = `${t('savingAnswers')} (${savedCount}/${allUids.length})`;
-    document.getElementById('scoring-table').innerHTML =
-      `<div style="text-align:center;padding:48px 20px;color:var(--muted);font-weight:800;font-size:14px;">${t("calcScores")}</div>`;
-    document.getElementById('btn-next').style.display = 'none';
-    const rb = document.getElementById('btn-ready-next');
-    if (rb) rb.style.display = 'none';
+  // Host computes auto-scores once
+  if (me.isHost && !gameState.roundScores) {
+    const scores = {};
+    players.forEach(([uid]) => { scores[uid] = {}; });
+    cats.forEach((_, ci) => {
+      const vals = {};
+      players.forEach(([uid]) => {
+        vals[uid] = (answers[uid]?.[ci] || '').trim().toLowerCase();
+      });
+      // Count how many gave same answer
+      const countMap = {};
+      players.forEach(([uid]) => {
+        const v = vals[uid];
+        if (v) countMap[v] = (countMap[v] || 0) + 1;
+      });
+
+      players.forEach(([uid]) => {
+        const v = vals[uid];
+        const letter = gameState.currentLetter;
+        if (!v || v[0].toUpperCase() !== letter) {
+          scores[uid][ci] = 0;
+        } else {
+          const count = countMap[v] || 1;
+          if (count === 1)      scores[uid][ci] = 100;
+          else if (count === 2) scores[uid][ci] = 50;
+          else                  scores[uid][ci] = 25;
+        }
+      });
+    });
+    update(ref(db, `rooms/${roomCode}`), { roundScores: scores });
     return;
   }
-
-  if (subEl) subEl.textContent = me.isHost
-    ? t('hostSubtitle') : t('guestSubtitle');
 
   const scores = gameState.roundScores || {};
   const grid   = document.getElementById('scoring-table');
   grid.innerHTML = '';
 
+  // Determine who corrects whom
+  // Each player corrects the RIVAL's answers (not their own)
+  // Player A edits scores for player B, and B edits for A
+  // For simplicity: a player can edit any score EXCEPT their own
+  const canEditUid = (targetUid) => targetUid !== me.uid;
+
   // Header
-  let headHTML = `<div class="st-head-cat">${t('catHeader')}</div>`;
+  let headHTML = '<div class="st-head-cat">Categoría</div>';
   players.forEach(([uid, p]) => {
-    const isMe = uid === me.uid;
     headHTML += `<div class="st-head-p" style="border-top:3px solid ${p.color}">
       ${p.emoji}<br><span>${p.name}</span>
-      <em class="${isMe ? 'you-col' : 'rival-col'}">${isMe ? '(tú) ✏️' : '✏️ editar'}</em>
+      ${uid === me.uid ? '<span class="you-tag">(tú)</span>' : ''}
     </div>`;
   });
   grid.innerHTML = `<div class="st-head-row">${headHTML}</div>`;
 
+  // Rows
   cats.forEach((cat, ci) => {
     let rowHTML = `<div class="st-cat-cell">${cat.icon} ${cat.name}</div>`;
-    players.forEach(([uid]) => {
+    players.forEach(([uid, p]) => {
       const ans = (answers[uid]?.[ci] || '').trim();
       const pts = scores[uid]?.[ci] ?? 0;
-      const cls = ptsClass(pts);
+      const ptsClass = pts === 100 ? 'pts-100' : pts === 50 ? 'pts-50' : pts === 25 ? 'pts-25' : 'pts-0';
+      const canEdit = canEditUid(uid);
       rowHTML += `<div class="st-cell">
-        <div class="st-ans ${!ans ? 'empty' : ''} ans-scored-${cls}" id="ans-cell-${uid}-${ci}">${ans || '—'}</div>
-        <select class="st-sel ${cls}" data-uid="${uid}" data-ci="${ci}" onchange="updateScore(this)">
-          <option value="100" ${pts===100?'selected':''}>✅ 100 — Válida única</option>
-          <option value="50"  ${pts===50 ?'selected':''}>🟡 50 — Repetida x2</option>
-          <option value="25"  ${pts===25 ?'selected':''}>🟠 25 — Repetida x3+</option>
-          <option value="0"   ${pts===0  ?'selected':''}>❌ 0 — Inválida</option>
-        </select>
+        <div class="st-ans ${!ans ? 'empty' : ''}">${ans || '—'}</div>
+        ${canEdit
+          ? `<select class="st-sel ${ptsClass}" data-uid="${uid}" data-ci="${ci}" onchange="updateScore(this)">
+              <option value="100" ${pts===100?'selected':''}>100 — Única</option>
+              <option value="50"  ${pts===50 ?'selected':''}>50 — Repetida x2</option>
+              <option value="25"  ${pts===25 ?'selected':''}>25 — Repetida x3+</option>
+              <option value="0"   ${pts===0  ?'selected':''}>0 — Inválida</option>
+             </select>`
+          : `<div class="st-pts-badge ${ptsClass} own-score">${pts} pts<span class="own-tag">tus pts</span></div>`
+        }
       </div>`;
     });
     grid.innerHTML += `<div class="st-row">${rowHTML}</div>`;
   });
 
   // Totals
-  let totHTML = `<div class="st-total-lbl">${t('thisRound')}</div>`;
-  let accHTML = `<div class="st-acc-lbl">${t('accumulated')}</div>`;
-  players.forEach(([uid]) => {
-    const rt = Object.values(scores[uid] || {}).reduce((a, b) => a + (b ?? 0), 0);
-    const prev = gameState.players[uid]?.totalScore || 0;
-    totHTML += `<div class="st-total-val" id="tot-${uid}">${rt}</div>`;
-    accHTML += `<div class="st-acc-val"  id="acc-${uid}">${prev + rt}</div>`;
+  let totHTML = '<div class="st-total-lbl">TOTAL RONDA</div>';
+  players.forEach(([uid, p]) => {
+    const total = Object.values(scores[uid] || {}).reduce((a,b) => a+b, 0);
+    totHTML += `<div class="st-total-val" id="tot-${uid}">${total} pts</div>`;
   });
   grid.innerHTML += `<div class="st-total-row">${totHTML}</div>`;
-  grid.innerHTML += `<div class="st-acc-row">${accHTML}</div>`;
 
-  // Buttons
-  const isLast   = parseInt(gameState.currentRound) >= parseInt(gameState.settings.totalRounds);
-  const nextBtn  = document.getElementById('btn-next');
-  const readyBtn = document.getElementById('btn-ready-next');
-  const readyInfo= document.getElementById('ready-count-info');
-  const readyNext= gameState.readyForNext || {};
-  const allUids  = Object.keys(gameState.players || {});
+  document.getElementById('btn-next').style.display = me.isHost ? 'block' : 'none';
+  document.getElementById('waiting-next').style.display = me.isHost ? 'none' : 'block';
 
-  if (me.isHost) {
-    const guests = allUids.filter(uid => uid !== gameState.host);
-    const gReady = guests.filter(uid => readyNext[uid]).length;
-    const allGuestsReady = guests.length === 0 || gReady === guests.length;
-
-    nextBtn.style.display  = 'block';
-    nextBtn.disabled       = !allGuestsReady;
-    nextBtn.style.opacity  = allGuestsReady ? '1' : '0.45';
-    nextBtn.textContent    = allGuestsReady
-      ? (isLast ? t('finalBtn') : t('nextBtn'))
-      : `${t('waitingPlayers')} (${gReady}/${guests.length} ${t('guestsReady')})`;
-    if (readyBtn) readyBtn.style.display = 'none';
-    if (readyInfo) {
-      readyInfo.textContent    = guests.length > 0 ? `👥 ${gReady}/${guests.length} ${t('guestsReady')}` : '';
-      readyInfo.style.display  = guests.length > 0 ? 'block' : 'none';
-    }
-  } else {
-    nextBtn.style.display = 'none';
-    if (readyInfo) readyInfo.style.display = 'none';
-    if (readyBtn) {
-      readyBtn.style.display = 'block';
-      const iReady = !!readyNext[me.uid];
-      readyBtn.textContent   = iReady ? t('readyNextWait') : t('readyNextBtn');
-      readyBtn.disabled      = iReady;
-      readyBtn.style.opacity = iReady ? '0.6' : '1';
-    }
-  }
-
-  if (!document.getElementById('screen-scoring')._scrolled) {
-    document.getElementById('screen-scoring')._scrolled = true;
-    setTimeout(() => {
-      document.getElementById('scoring-table')?.scrollIntoView({ behavior:'smooth', block:'start' });
-    }, 300);
-    setTimeout(() => {
-      const ab = me.isHost ? document.getElementById('btn-next') : document.getElementById('btn-ready-next');
-      if (ab && ab.style.display !== 'none') ab.scrollIntoView({ behavior:'smooth', block:'nearest' });
-    }, 900);
-  }
-}
-
-window.markReadyForNext = async function() {
-  const btn = document.getElementById('btn-ready-next');
-  if (btn) { btn.disabled = true; btn.textContent = t('readyNextWait'); btn.style.opacity = '0.6'; }
-  await set(ref(db, `rooms/${roomCode}/readyForNext/${me.uid}`), true);
-};
-
-function ptsClass(pts) {
-  const n = parseInt(pts) || 0;
-  return n >= 100 ? 'pts-100' : n >= 50 ? 'pts-50' : n >= 25 ? 'pts-25' : 'pts-0';
+  const isLast = gameState.currentRound >= gameState.settings.totalRounds;
+  document.getElementById('btn-next').textContent =
+    isLast ? '🏆 VER RESULTADOS FINALES' : 'SIGUIENTE RONDA →';
 }
 
 window.updateScore = function(sel) {
   const uid = sel.dataset.uid;
   const ci  = parseInt(sel.dataset.ci);
   const pts = parseInt(sel.value);
-  const cls = ptsClass(pts);
 
-  set(ref(db, `rooms/${roomCode}/roundScores/${uid}/${ci}`), pts);
+  // Prevent editing own score
+  if (uid === me.uid) return;
+
+  update(ref(db, `rooms/${roomCode}/roundScores/${uid}/${ci}`), pts);
+  const cls = pts===100?'pts-100':pts===50?'pts-50':pts===25?'pts-25':'pts-0';
   sel.className = `st-sel ${cls}`;
 
-  const cell = document.getElementById(`ans-cell-${uid}-${ci}`);
-  if (cell) {
-    cell.className = cell.className.replace(/\bans-scored-pts-\S+/g, '').trim() + ` ans-scored-${cls}`;
-  }
-
-  const localScores = JSON.parse(JSON.stringify(gameState.roundScores || {}));
-  if (!localScores[uid]) localScores[uid] = {};
-  localScores[uid][ci] = pts;
-  const rt   = Object.values(localScores[uid]).reduce((a, b) => a + (b ?? 0), 0);
-  const prev = gameState.players[uid]?.totalScore || 0;
-  const totEl = document.getElementById(`tot-${uid}`);
-  const accEl = document.getElementById(`acc-${uid}`);
-  if (totEl) totEl.textContent = rt;
-  if (accEl) accEl.textContent = prev + rt;
+  // Recalc total
+  const scores = gameState.roundScores || {};
+  scores[uid] = scores[uid] || {};
+  scores[uid][ci] = pts;
+  const total = Object.values(scores[uid]).reduce((a,b)=>a+b,0);
+  const el = document.getElementById(`tot-${uid}`);
+  if (el) el.textContent = total + ' pts';
 };
 
-// ══════════════════════════════════════════════════════
-//  NEXT ROUND / END GAME  (host only)
-// ══════════════════════════════════════════════════════
-let _nextRoundBusy = false;
 window.nextRound = async function() {
-  if (!me.isHost || _nextRoundBusy) return;
-  _nextRoundBusy = true;
-  const btn = document.getElementById('btn-next');
-  if (btn) { btn.disabled = true; btn.textContent = '⏳ Guardando...'; }
+  if (!me.isHost) return;
+  const snap = await get(ref(db, `rooms/${roomCode}`));
+  const data = snap.val();
+  const scores = data.roundScores || {};
+  const updates = {};
 
-  try {
-    const snap   = await get(ref(db, `rooms/${roomCode}`));
-    const data   = snap.val();
-    if (data.status !== 'scoring') { _nextRoundBusy = false; return; }
+  Object.keys(data.players).forEach(uid => {
+    const roundTotal = Object.values(scores[uid] || {}).reduce((a,b) => a+b, 0);
+    updates[`players/${uid}/totalScore`] =
+      (data.players[uid].totalScore || 0) + roundTotal;
+  });
 
-    const scores = data.roundScores || {};
-    const updates = {};
+  const isLast = data.currentRound >= data.settings.totalRounds;
 
-    Object.keys(data.players).forEach(uid => {
-      const rt = Object.values(scores[uid] || {}).reduce((a, b) => a + (b ?? 0), 0);
-      updates[`players/${uid}/totalScore`] = (data.players[uid].totalScore || 0) + rt;
-    });
-
-    const cur   = parseInt(data.currentRound);
-    const total = parseInt(data.settings.totalRounds);
-    const isLast = cur >= total;
-
-    if (isLast) {
-      updates['status']        = 'results';
-      updates['stoppedBy']     = null;
-      updates['stopCountdownEndsAt'] = null;
-      updates['roundScores']   = null;
-      updates['scoresReady']   = null;
-      updates['readyForNext']  = null;
-      updates['answersSaved']  = null;
-      await update(ref(db, `rooms/${roomCode}`), updates);
-    } else {
-      const nextLetterState = getNextLetterState(data);
-      updates['status']        = 'letter';
-      updates['currentRound']  = cur + 1;
-      updates['currentLetter'] = nextLetterState.letter;
-      updates['usedLetters']   = nextLetterState.usedLetters;
-      updates['letterBag']     = nextLetterState.letterBag;
-      updates['letterCursor']  = nextLetterState.letterCursor;
-      updates['stoppedBy']     = null;
-      updates['stopCountdownEndsAt'] = null;
-      updates['roundScores']   = null;
-      updates['scoresReady']   = null;
-      updates['readyForNext']  = null;
-      updates['answersSaved']  = null;
-      updates['answers']       = buildEmptyAnswersFrom(data);
-      await update(ref(db, `rooms/${roomCode}`), updates);
-    }
-  } catch(e) {
-    console.error('nextRound error:', e);
-    if (btn) { btn.disabled = false; btn.textContent = 'SIGUIENTE RONDA →'; }
-  } finally {
-    _nextRoundBusy = false;
+  if (isLast) {
+    updates['status'] = 'results';
+    updates['roundScores'] = null;
+    await update(ref(db, `rooms/${roomCode}`), updates);
+  } else {
+    const used = data.usedLetters || [];
+    const letter = pickLetter(used);
+    used.push(letter);
+    updates['status'] = 'letter';
+    updates['currentRound'] = data.currentRound + 1;
+    updates['currentLetter'] = letter;
+    updates['usedLetters'] = used;
+    updates['stoppedBy'] = null;
+    updates['roundScores'] = null;
+    updates['answers'] = buildEmptyAnswersFrom(data);
+    await update(ref(db, `rooms/${roomCode}`), updates);
   }
 };
 
 function buildEmptyAnswersFrom(data) {
+  const cats = data.settings.categories;
   const ans = {};
   Object.keys(data.players).forEach(uid => {
     ans[uid] = {};
-    data.settings.categories.forEach((_, ci) => { ans[uid][ci] = ''; });
+    cats.forEach((_, ci) => { ans[uid][ci] = ''; });
   });
   return ans;
 }
 
-// ── RESULTS ───────────────────────────────────
+// ══════════════════════════════════════════════
+//  RESULTS SCREEN — announce winner
+// ══════════════════════════════════════════════
 function renderResultsScreen() {
   if (!document.getElementById('screen-results').classList.contains('active')) {
-    showScreen('screen-results'); scrollTop(); launchConfetti();
+    showScreen('screen-results');
+    launchConfetti();
   }
-  const sorted = Object.entries(gameState.players||{}).sort((a,b) => b[1].totalScore - a[1].totalScore);
-  const [winUid, winPlayer] = sorted[0];
-  const iWon = winUid === me.uid;
-  document.getElementById('winner-emoji').textContent = winPlayer.emoji;
-  document.getElementById('winner-name').textContent  = winPlayer.name.toUpperCase();
-  document.getElementById('winner-score-lbl').textContent = `${winPlayer.totalScore.toLocaleString()} ${t('points')}`;
-  const msgEl = document.getElementById('winner-msg');
-  msgEl.textContent = iWon ? t('congrats') : `${t('wellPlayed')} ${winPlayer.name} ${t('bestThisTime')}`;
-  msgEl.style.color = iWon ? '#059669' : '#64748b';
 
+  const sorted = Object.entries(gameState.players || {})
+    .sort((a, b) => b[1].totalScore - a[1].totalScore);
+
+  const winner = sorted[0][1];
+  const isMe = sorted[0][0] === me.uid;
+
+  document.getElementById('winner-emoji').textContent = winner.emoji;
+  document.getElementById('winner-name').textContent  = winner.name.toUpperCase();
+  document.getElementById('winner-score').textContent = winner.totalScore + ' puntos';
+
+  // Personalized message
+  const msgEl = document.getElementById('winner-message');
+  if (isMe) {
+    msgEl.textContent = '🎉 ¡Felicidades, ganaste!';
+    msgEl.style.color = 'var(--green)';
+  } else {
+    msgEl.textContent = `¡Bien jugado! ${winner.name} fue el mejor esta vez.`;
+    msgEl.style.color = 'var(--muted)';
+  }
+
+  // Podium
   const podium = document.getElementById('podium');
   podium.innerHTML = '';
-  const order=[1,0,2], hts=[100,140,80], medals=['🥈','🥇','🥉'];
-  const grads=['linear-gradient(135deg,#94a3b8,#475569)','linear-gradient(135deg,#fbbf24,#f59e0b)','linear-gradient(135deg,#b45309,#78350f)'];
+  const order  = [1, 0, 2];
+  const hts    = [100, 140, 80];
+  const medals = ['🥈','🥇','🥉'];
+  const grads  = [
+    'linear-gradient(135deg,#94a3b8,#64748b)',
+    'linear-gradient(135deg,#ffd166,#f4a261)',
+    'linear-gradient(135deg,#c27c3e,#92400e)',
+  ];
+
   order.forEach((rank, slot) => {
     if (!sorted[rank]) return;
     const [uid, p] = sorted[rank];
     const el = document.createElement('div');
-    el.className = 'podium-place' + (uid===me.uid?' podium-me':'');
-    el.style.animationDelay = `${slot*0.15}s`;
+    el.className = 'podium-place' + (uid === me.uid ? ' podium-me' : '');
+    el.style.animation = `fadeIn 0.5s ease ${slot*0.15}s both`;
     el.innerHTML = `
-      <div style="font-size:30px">${p.emoji}</div>
+      <div style="font-size:28px">${p.emoji}</div>
       <div class="pod-name">${p.name}</div>
       <div class="pod-block" style="height:${hts[slot]}px;background:${grads[slot]}">
-        <div style="font-size:26px">${medals[slot]}</div>
-        <div class="pod-pts">${p.totalScore.toLocaleString()}</div>
-      </div>`;
+        <div style="font-size:28px">${medals[slot]}</div>
+        <div style="font-size:13px;color:rgba(0,0,0,0.6);font-family:'Bebas Neue',sans-serif;letter-spacing:1px">${p.totalScore} pts</div>
+      </div>
+    `;
     podium.appendChild(el);
   });
 
+  // Leaderboard
   const lb = document.getElementById('leaderboard');
   lb.innerHTML = '';
   sorted.forEach(([uid, p], i) => {
     const row = document.createElement('div');
-    row.className = 'lb-row' + (uid===me.uid?' me':'');
-    row.style.animationDelay = `${i*0.08+0.3}s`;
+    row.className = 'lb-row' + (uid === me.uid ? ' me' : '');
+    row.style.animation = `fadeIn 0.4s ease ${i*0.08+0.3}s both`;
     row.innerHTML = `
       <div class="lb-rank">${i+1}</div>
       <div style="font-size:22px">${p.emoji}</div>
-      <div class="lb-name">${p.name}${uid===me.uid?` <span class="you-tag">${t('youTag')}</span>`:''}</div>
-      <div class="lb-pts">${p.totalScore.toLocaleString()}</div>`;
+      <div class="lb-name">${p.name}${uid === me.uid ? ' <span style="font-size:11px;color:var(--muted)">(tú)</span>' : ''}</div>
+      <div class="lb-pts">${p.totalScore}</div>
+    `;
     lb.appendChild(row);
   });
 
   document.getElementById('btn-play-again').style.display = me.isHost ? 'block' : 'none';
   document.getElementById('play-again-hint').style.display = me.isHost ? 'none' : 'block';
 }
+
 window.playAgain = async function() {
   if (!me.isHost) return;
-  _lastRenderedRound = null;
-  _nextRoundBusy = false;
-  _savedForRound = null;
   const snap = await get(ref(db, `rooms/${roomCode}`));
   const data = snap.val();
-  const updates = {
-    status: 'waiting',
-    currentRound: 0,
-    answers: null,
-    roundScores: null,
-    scoresReady: null,
-    readyForNext: null,
-    answersSaved: null,
-    stoppedBy: null,
-    stopCountdownEndsAt: null,
-    usedLetters: [],
-    letterBag: buildShuffledLetterBag(),
-    letterCursor: -1,
-    currentLetter: ''
-  };
+  const updates = { status: 'waiting', currentRound: 0, answers: null, roundScores: null, stoppedBy: null };
   Object.keys(data.players).forEach(uid => {
     updates[`players/${uid}/totalScore`] = 0;
     updates[`players/${uid}/ready`] = false;
   });
   await update(ref(db, `rooms/${roomCode}`), updates);
-  saveSession();
 };
 
-// ── UTILS ─────────────────────────────────────
+// ══════════════════════════════════════════════
+//  UTILS
+// ══════════════════════════════════════════════
 function generateCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  return Array.from({length:5}, () => chars[Math.floor(Math.random()*chars.length)]).join('');
+  let code = '';
+  for (let i = 0; i < 5; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return code;
 }
-function shuffleLetters(arr) {
-  for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [arr[i], arr[j]] = [arr[j], arr[i]];
-  }
-  return arr;
+
+function pickLetter(used) {
+  const avail = LETTERS.filter(l => !used.includes(l));
+  return avail.length ? avail[Math.floor(Math.random() * avail.length)] : LETTERS[Math.floor(Math.random() * LETTERS.length)];
 }
-function buildShuffledLetterBag(previousLastLetter = null) {
-  const bag = shuffleLetters([...LETTERS]);
-  if (previousLastLetter && bag.length > 1 && bag[0] === previousLastLetter) {
-    const swapIdx = bag.findIndex((l, i) => i > 0 && l !== previousLastLetter);
-    if (swapIdx > 0) [bag[0], bag[swapIdx]] = [bag[swapIdx], bag[0]];
-  }
-  return bag;
-}
-function ensureLetterCycleState(room) {
-  const state = { ...(room || {}) };
-  const usedRaw = Array.isArray(state.usedLetters) ? state.usedLetters : [];
-  const used = [];
 
-  usedRaw.forEach(l => {
-    if (LETTERS.includes(l) && !used.includes(l)) used.push(l);
-  });
-
-  if (!Array.isArray(state.letterBag) || !state.letterBag.length) {
-    const remaining = LETTERS.filter(l => !used.includes(l));
-    state.letterBag = [...used, ...shuffleLetters([...remaining])];
-  }
-
-  const maxCursor = state.letterBag.length - 1;
-  if (!Number.isInteger(state.letterCursor)) {
-    state.letterCursor = used.length ? used.length - 1 : -1;
-  }
-  state.letterCursor = Math.max(-1, Math.min(state.letterCursor, maxCursor));
-  state.usedLetters = used.length
-    ? used
-    : (state.letterCursor >= 0 ? state.letterBag.slice(0, state.letterCursor + 1) : []);
-
-  return state;
-}
-function getNextLetterState(room) {
-  const state = ensureLetterCycleState(room);
-  let bag = [...state.letterBag];
-  let cursor = state.letterCursor;
-
-  if (cursor + 1 >= bag.length) {
-    const lastLetter = bag[bag.length - 1] || null;
-    bag = buildShuffledLetterBag(lastLetter);
-    cursor = -1;
-  }
-
-  cursor += 1;
-  const letter = bag[cursor];
-
-  return {
-    letter,
-    letterBag: bag,
-    letterCursor: cursor,
-    usedLetters: bag.slice(0, cursor + 1)
-  };
-}
 function shake(id) {
   const el = document.getElementById(id);
   el.style.animation = 'shake 0.4s ease';
   setTimeout(() => el.style.animation = '', 400);
 }
+
 function launchConfetti() {
-  const colors = ['#e63946','#2563eb','#fbbf24','#059669','#7c3aed','#0891b2'];
+  const colors = ['#ff6b35','#ffd166','#06d6a0','#a855f7','#3b82f6','#f472b6'];
   for (let i = 0; i < 90; i++) {
     setTimeout(() => {
       const p = document.createElement('div');
       p.className = 'confetti';
-      p.style.cssText = `left:${Math.random()*100}vw;top:-10px;background:${colors[~~(Math.random()*colors.length)]};width:${6+Math.random()*8}px;height:${6+Math.random()*8}px;border-radius:${Math.random()>.5?'50%':'2px'};animation-duration:${2+Math.random()*2}s;animation-delay:${Math.random()*.5}s;`;
+      p.style.cssText = `left:${Math.random()*100}vw;top:-10px;background:${colors[~~(Math.random()*colors.length)]};
+        width:${6+Math.random()*8}px;height:${6+Math.random()*8}px;
+        border-radius:${Math.random()>.5?'50%':'2px'};
+        animation-duration:${2+Math.random()*2}s;animation-delay:${Math.random()*.5}s;`;
       document.body.appendChild(p);
-      setTimeout(() => p.remove(), 4500);
+      setTimeout(()=>p.remove(), 4500);
     }, i * 35);
   }
 }
 
+// ══════════════════════════════════════════════
+//  BOOT
+// ══════════════════════════════════════════════
 window.me = me;
-tryRestoreSession().then(restored => {
-  if (!restored) {
-    // If player has a saved name, skip login and go straight to lobby
-    const savedName = localStorage.getItem('stop_name');
-    if (savedName && me.name) {
-      showScreen('screen-lobby-choice');
-      const pill = document.getElementById('lobby-user-pill');
-      if (pill) pill.innerHTML = `<span>${me.emoji}</span> ${me.name}`;
-    } else {
-      initLogin();
-    }
-  }
-  updateLeaveButtons();
-});
-
-document.addEventListener('visibilitychange', () => {
-  if (!roomCode || !me.uid) return;
-  setMyOnlineStatus(document.visibilityState === 'visible');
-});
-
-window.addEventListener('beforeunload', () => {
-  if (!roomCode || !me.uid) return;
-  setMyOnlineStatus(false);
-});
-
-window.addEventListener('focus', () => {
-  if (!roomCode || !me.uid) return;
-  setMyOnlineStatus(true);
-});
+initLogin();
 </script>
 
 <style>
-/* ════════════════════════════════════════════
-   PALETTE: White / Red / Blue / Navy
-════════════════════════════════════════════ */
 :root {
-  --bg:       #f1f5f9;
-  --surface:  #ffffff;
-  --surface2: #f8fafc;
-  --border:   #e2e8f0;
-  --border2:  #cbd5e1;
-  --red:      #e63946;
-  --red-dk:   #b91c1c;
-  --blue:     #2563eb;
-  --blue-dk:  #1d4ed8;
-  --navy:     #1e3a5f;
-  --green:    #059669;
-  --gold:     #d97706;
-  --muted:    #94a3b8;
-  --text:     #0f172a;
-  --text2:    #334155;
-  --text3:    #64748b;
-  --shadow:   0 1px 3px rgba(0,0,0,.05), 0 4px 14px rgba(0,0,0,.07);
-  --shadow-lg:0 4px 6px rgba(0,0,0,.04), 0 10px 36px rgba(0,0,0,.09);
-  --radius:   16px;
+  --bg: #f0eeff;
+  --panel: #ffffff;
+  --card: #ffffff;
+  --card2: #f7f5ff;
+  --border: #e0daf5;
+  --accent: #7c3aed;
+  --accent2: #ff6b35;
+  --gold: #d97706;
+  --green: #059669;
+  --red: #dc2626;
+  --purple: #7c3aed;
+  --blue: #2563eb;
+  --muted: #8b80b0;
+  --text: #1e1642;
+  --text2: #4a3f7a;
+  --shadow: 0 4px 24px rgba(124,58,237,0.10);
+  --shadow-lg: 0 8px 40px rgba(124,58,237,0.16);
 }
-* { box-sizing:border-box; margin:0; padding:0; }
+
+* { box-sizing: border-box; margin:0; padding:0; }
+
 body {
-  font-family:'Nunito',sans-serif;
-  background:var(--bg); color:var(--text);
-  min-height:100vh; overflow-x:hidden;
+  font-family: 'Nunito', sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  overflow-x: hidden;
 }
+
 body::before {
-  content:''; position:fixed; inset:0; z-index:0; pointer-events:none;
-  background-image: radial-gradient(circle, rgba(37,99,235,.07) 1.2px, transparent 1.2px);
-  background-size:28px 28px;
+  content:'';position:fixed;inset:0;
+  background:
+    radial-gradient(circle at 10% 10%, rgba(124,58,237,0.10) 0%, transparent 50%),
+    radial-gradient(circle at 90% 90%, rgba(255,107,53,0.10) 0%, transparent 50%),
+    radial-gradient(circle at 50% 50%, rgba(6,214,160,0.05) 0%, transparent 70%);
+  pointer-events:none;z-index:0;
 }
-.screen { display:none; position:relative; z-index:1; }
+
+/* Decorative dots pattern */
+body::after {
+  content:'';position:fixed;inset:0;
+  background-image: radial-gradient(circle, rgba(124,58,237,0.08) 1px, transparent 1px);
+  background-size: 32px 32px;
+  pointer-events:none;z-index:0;
+}
+
+.screen { display:none;position:relative;z-index:1; }
 .screen.active { display:block; }
 
-/* ════════════════════════════════════════════
-   CUSTOM MODAL / ALERT / CONFIRM
-════════════════════════════════════════════ */
-.modal-overlay {
-  position:fixed; inset:0; z-index:9999;
-  background:rgba(15,23,42,.55);
-  backdrop-filter:blur(6px);
-  display:flex; align-items:center; justify-content:center;
-  padding:20px;
-  opacity:0; transition:opacity .22s ease;
-}
-.modal-overlay.modal-visible { opacity:1; }
-.modal-box {
-  background:var(--surface);
-  border:1.5px solid var(--border);
-  border-radius:20px;
-  padding:32px 28px 24px;
-  max-width:380px; width:100%;
-  text-align:center;
-  box-shadow:0 8px 48px rgba(0,0,0,.18), 0 2px 8px rgba(0,0,0,.08);
-  transform:scale(.92) translateY(12px);
-  transition:transform .22s cubic-bezier(.34,1.56,.64,1);
-}
-.modal-overlay.modal-visible .modal-box {
-  transform:scale(1) translateY(0);
-}
-.modal-icon { font-size:42px; margin-bottom:12px; display:block; }
-.modal-msg {
-  font-size:15px; font-weight:700; color:var(--text2);
-  line-height:1.55; margin-bottom:22px;
-}
-.modal-btns { display:flex; gap:10px; }
-.modal-btn {
-  flex:1; padding:13px 10px;
-  border:none; border-radius:12px;
-  font-family:'Bebas Neue',sans-serif;
-  font-size:18px; letter-spacing:2px;
-  cursor:pointer; transition:all .2s;
-}
-.modal-btn-primary {
-  background:linear-gradient(135deg,var(--red),var(--red-dk));
-  color:#fff;
-  box-shadow:0 4px 14px rgba(230,57,70,.30);
-}
-.modal-btn-primary:hover { transform:translateY(-2px); box-shadow:0 7px 20px rgba(230,57,70,.44); }
-.modal-btn-secondary {
-  background:var(--surface2);
-  border:1.5px solid var(--border2);
-  color:var(--text3);
-}
-.modal-btn-secondary:hover { border-color:var(--blue); color:var(--blue); }
-
-/* ── LOGO ────────────────────────────────── */
-.logo-img {
-  width: clamp(100px, 30vw, 180px);
-  height: auto;
-  display: block;
-  margin: 0 auto 12px;
-  animation: letterPop .6s cubic-bezier(.34,1.56,.64,1);
-}
+/* ── GLOBAL ELEMENTS ─────────────────────── */
 .logo-big {
   font-family:'Bebas Neue',sans-serif;
-  font-size:clamp(72px,18vw,150px); line-height:.85; letter-spacing:4px;
-  background:linear-gradient(135deg,var(--red) 0%,var(--blue) 100%);
-  -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text;
-  filter:drop-shadow(0 2px 14px rgba(230,57,70,.18));
+  font-size:clamp(70px,18vw,150px);
+  line-height:.85;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+  filter:drop-shadow(0 4px 24px rgba(124,58,237,0.25));
+  letter-spacing:4px;
 }
-.logo-sub { font-size:11px; letter-spacing:5px; text-transform:uppercase; color:var(--muted); font-weight:800; margin-top:6px; }
+.logo-sub {
+  font-size:11px;letter-spacing:6px;text-transform:uppercase;
+  color:var(--muted);margin-top:4px;font-weight:800;
+}
 
-/* ── CARD ────────────────────────────────── */
-.card { background:var(--surface); border:1.5px solid var(--border); border-radius:var(--radius); padding:22px; margin-bottom:16px; box-shadow:var(--shadow); }
-.section-label { font-size:10px; letter-spacing:4px; text-transform:uppercase; color:var(--blue); font-weight:900; margin-bottom:12px; }
+.card {
+  background:var(--card);
+  border:1.5px solid var(--border);
+  border-radius:20px;
+  padding:22px;
+  margin-bottom:16px;
+  box-shadow:var(--shadow);
+}
 
-/* ── INPUT ───────────────────────────────── */
+.section-label {
+  font-size:10px;letter-spacing:4px;text-transform:uppercase;
+  color:var(--accent);font-weight:900;margin-bottom:12px;
+}
+
 input[type=text] {
-  width:100%; background:var(--surface2); border:1.5px solid var(--border);
-  border-radius:10px; padding:13px 16px; color:var(--text);
-  font-family:'Nunito',sans-serif; font-size:15px; font-weight:700;
-  outline:none; transition:border-color .2s, box-shadow .2s;
+  width:100%;background:var(--card2);border:1.5px solid var(--border);
+  border-radius:12px;padding:14px 16px;color:var(--text);
+  font-family:'Nunito',sans-serif;font-size:15px;font-weight:700;
+  outline:none;transition:border-color .2s, box-shadow .2s;
 }
-input[type=text]:focus { border-color:var(--blue); box-shadow:0 0 0 3px rgba(37,99,235,.12); }
-input[type=text]::placeholder { color:var(--muted); font-weight:600; }
+input[type=text]:focus {
+  border-color:var(--accent);
+  box-shadow: 0 0 0 3px rgba(124,58,237,0.12);
+}
+input[type=text]::placeholder { color:var(--muted);font-weight:600; }
 
-/* ── BUTTONS ─────────────────────────────── */
 .btn-main {
-  width:100%; padding:16px;
-  background:linear-gradient(135deg,var(--red),var(--red-dk));
-  border:none; border-radius:12px;
-  font-family:'Bebas Neue',sans-serif; font-size:24px; letter-spacing:3px;
-  color:#fff; cursor:pointer; transition:all .25s;
-  box-shadow:0 4px 16px rgba(230,57,70,.33); margin-top:8px;
+  width:100%;padding:17px;
+  background:linear-gradient(135deg,var(--accent),#a855f7);
+  border:none;border-radius:14px;
+  font-family:'Bebas Neue',sans-serif;font-size:24px;letter-spacing:3px;
+  color:white;cursor:pointer;transition:all .3s;
+  box-shadow:0 6px 24px rgba(124,58,237,0.30);
+  margin-top:8px;
 }
-.btn-main:hover { transform:translateY(-2px); box-shadow:0 8px 24px rgba(230,57,70,.44); }
-.btn-main:disabled { opacity:.4; cursor:not-allowed; transform:none; }
+.btn-main:hover { transform:translateY(-2px);box-shadow:0 12px 36px rgba(124,58,237,0.45); }
+.btn-main:disabled { opacity:.4;cursor:not-allowed;transform:none; }
 
 .btn-sec {
-  width:100%; padding:14px;
-  background:var(--surface); border:2px solid var(--border2);
-  border-radius:12px; font-family:'Bebas Neue',sans-serif;
-  font-size:20px; letter-spacing:2px; color:var(--text3);
-  cursor:pointer; transition:all .2s;
+  width:100%;padding:14px;
+  background:transparent;border:2px solid var(--border);
+  border-radius:14px;font-family:'Bebas Neue',sans-serif;
+  font-size:20px;letter-spacing:2px;color:var(--muted);
+  cursor:pointer;transition:all .2s;
 }
-.btn-sec:hover { border-color:var(--blue); color:var(--blue); }
+.btn-sec:hover { border-color:var(--accent);color:var(--accent); }
 
 .btn-back {
-  background:none; border:none; color:var(--muted);
-  font-size:13px; font-weight:700; cursor:pointer;
-  padding:8px 0 16px; display:flex; align-items:center; gap:6px;
+  background:none;border:none;color:var(--muted);
+  font-size:13px;font-weight:700;cursor:pointer;
+  padding:8px 0 16px;display:flex;align-items:center;gap:6px;
   font-family:'Nunito',sans-serif;
 }
 .btn-back:hover { color:var(--text); }
-.you-tag { color:var(--muted); font-size:11px; font-weight:700; }
 
-/* ════════════════════════════════════════════
-   LOGIN
-════════════════════════════════════════════ */
-#screen-login { max-width:420px; margin:0 auto; padding:44px 20px; text-align:center; }
-.login-header { margin-bottom:32px; animation:fadeDown .5s ease; }
+/* ── LOGIN ───────────────────────────────── */
+#screen-login {
+  max-width:420px;margin:0 auto;
+  padding:40px 20px;text-align:center;
+}
+.login-header { margin-bottom:32px;animation:fadeDown .5s ease; }
+
 .avatar-big {
-  width:82px; height:82px; border-radius:50%;
-  display:inline-flex; align-items:center; justify-content:center;
-  font-size:42px; margin:0 auto 20px; cursor:pointer;
-  transition:transform .2s; box-shadow:var(--shadow);
+  width:80px;height:80px;border-radius:50%;
+  display:inline-flex;align-items:center;justify-content:center;
+  font-size:40px;margin:0 auto 20px;cursor:pointer;
+  transition:transform .2s;
+  box-shadow: var(--shadow);
 }
-.avatar-big:hover { transform:scale(1.06); }
-.emoji-picker { display:grid; grid-template-columns:repeat(6,1fr); gap:6px; margin:10px 0 16px; }
+.avatar-big:hover { transform:scale(1.05); }
+
+.emoji-picker {
+  display:grid;grid-template-columns:repeat(6,1fr);
+  gap:6px;margin:10px 0 16px;
+}
 .emoji-opt {
-  border:1.5px solid; border-radius:8px; padding:8px 4px;
-  font-size:20px; cursor:pointer; transition:transform .15s, box-shadow .15s;
+  border:1.5px solid var(--border);border-radius:8px;padding:8px 4px;
+  font-size:20px;cursor:pointer;transition:transform .15s,box-shadow .15s;
+  background:var(--card2);
 }
-.emoji-opt:hover { transform:scale(1.18); }
-.emoji-opt.sel { box-shadow:0 0 0 2.5px var(--blue); transform:scale(1.1); }
+.emoji-opt:hover { transform:scale(1.15);box-shadow:var(--shadow); }
+.emoji-opt.sel { box-shadow:0 0 0 2px var(--accent);transform:scale(1.1); }
 
-/* ════════════════════════════════════════════
-   LOBBY CHOICE
-════════════════════════════════════════════ */
-#screen-lobby-choice { max-width:420px; margin:0 auto; padding:60px 20px; text-align:center; }
+/* ── LOBBY CHOICE ────────────────────────── */
+#screen-lobby-choice {
+  max-width:420px;margin:0 auto;
+  padding:60px 20px;text-align:center;
+}
 .user-pill {
-  display:inline-flex; align-items:center; gap:10px;
-  background:var(--surface); border:1.5px solid var(--border);
-  border-radius:999px; padding:8px 20px; margin-bottom:8px;
-  font-size:14px; font-weight:800; box-shadow:var(--shadow);
+  display:inline-flex;align-items:center;gap:10px;
+  background:var(--card);border:1.5px solid var(--border);
+  border-radius:999px;padding:8px 18px;margin-bottom:32px;
+  font-size:14px;font-weight:800;
+  box-shadow:var(--shadow);
 }
-/* Back-to-login link under the user pill */
-.btn-change-user {
-  display:inline-flex; align-items:center; gap:5px;
-  background:none; border:none;
-  color:var(--muted); font-family:'Nunito',sans-serif;
-  font-size:12px; font-weight:700; cursor:pointer;
-  padding:2px 8px 20px; letter-spacing:.3px;
-  transition:color .2s;
-}
-.btn-change-user:hover { color:var(--blue); }
 
-/* ════════════════════════════════════════════
-   CREATE
-════════════════════════════════════════════ */
-#screen-create { max-width:620px; margin:0 auto; padding:24px 20px; }
+/* ── CREATE ROOM ─────────────────────────── */
+#screen-create { max-width:620px;margin:0 auto;padding:24px 20px; }
+
 .cat-chip {
-  display:flex; align-items:center; gap:6px;
-  background:var(--surface2); border:1.5px solid var(--border);
-  border-radius:10px; padding:8px 12px; cursor:pointer;
-  font-size:12px; font-weight:800; transition:all .2s; user-select:none; color:var(--text2);
+  display:flex;align-items:center;gap:6px;
+  background:var(--card2);border:1.5px solid var(--border);
+  border-radius:10px;padding:8px 12px;cursor:pointer;
+  font-size:12px;font-weight:800;transition:all .2s;
+  user-select:none;color:var(--text2);
 }
-.cat-chip .chk { font-size:10px; color:var(--green); opacity:0; margin-left:auto; transition:opacity .2s; }
-.cat-chip.sel { border-color:var(--blue); background:rgba(37,99,235,.06); color:var(--blue); }
+.cat-chip .chk { font-size:10px;color:var(--green);opacity:0;margin-left:auto;transition:opacity .2s; }
+.cat-chip.sel { border-color:var(--accent);background:rgba(124,58,237,0.08);color:var(--accent); }
 .cat-chip.sel .chk { opacity:1; }
-.cats-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(130px,1fr)); gap:7px; margin-bottom:12px; }
-.custom-cat-row { display:flex; gap:8px; margin-bottom:4px; }
-.custom-cat-row input { flex:1; width:auto; font-size:13px; padding:10px 14px; }
-.btn-add-cat { padding:10px 16px; background:var(--blue); border:none; border-radius:10px; color:#fff; font-family:'Nunito',sans-serif; font-weight:800; font-size:13px; cursor:pointer; white-space:nowrap; transition:all .2s; }
-.btn-add-cat:hover { background:var(--blue-dk); transform:scale(1.02); }
-.rounds-row { display:flex; gap:8px; flex-wrap:wrap; }
-.round-opt { padding:9px 20px; background:var(--surface2); border:1.5px solid var(--border); border-radius:10px; color:var(--muted); font-family:'Nunito',sans-serif; font-weight:800; font-size:14px; cursor:pointer; transition:all .2s; }
-.round-opt.sel { border-color:var(--red); background:rgba(230,57,70,.06); color:var(--red); }
 
-/* ════════════════════════════════════════════
-   JOIN
-════════════════════════════════════════════ */
-#screen-join { max-width:420px; margin:0 auto; padding:48px 20px; text-align:center; }
-.code-input { font-size:30px !important; letter-spacing:10px; text-align:center; text-transform:uppercase; font-family:'Bebas Neue',sans-serif !important; }
+.cats-grid { display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:7px;margin-bottom:12px; }
 
-/* ════════════════════════════════════════════
-   WAITING ROOM
-════════════════════════════════════════════ */
-#screen-waiting { max-width:500px; margin:0 auto; padding:34px 20px; text-align:center; }
-.room-share-hint { font-size:11px; color:var(--muted); letter-spacing:3px; text-transform:uppercase; font-weight:800; margin-bottom:6px; }
-.room-code-big {
-  font-family:'Bebas Neue',sans-serif; font-size:clamp(64px,16vw,116px);
-  letter-spacing:12px; color:var(--red);
-  animation:codePulse 2.5s infinite;
-}
-@keyframes codePulse {
-  0%,100%{ filter:drop-shadow(0 2px 10px rgba(230,57,70,.20)); }
-  50%    { filter:drop-shadow(0 2px 28px rgba(230,57,70,.50)); }
-}
-.room-info-badge { display:inline-block; background:var(--surface); border:1.5px solid var(--border); border-radius:999px; padding:5px 18px; font-size:12px; color:var(--text3); font-weight:700; margin-bottom:24px; box-shadow:var(--shadow); }
-.waiting-players { display:flex; flex-direction:column; gap:8px; margin-bottom:20px; text-align:left; }
-.waiting-player { display:flex; align-items:center; gap:12px; background:var(--surface); border:1.5px solid var(--border); border-radius:12px; padding:12px 16px; animation:slideIn .3s ease; box-shadow:var(--shadow); }
-.waiting-player.me { border-color:var(--red); background:rgba(230,57,70,.03); }
-.w-avatar { width:38px; height:38px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:20px; flex-shrink:0; }
-.w-name { flex:1; font-size:14px; font-weight:800; }
-.host-badge { background:rgba(217,119,6,.10); border:1px solid rgba(217,119,6,.30); border-radius:999px; padding:3px 10px; font-size:11px; font-weight:800; color:var(--gold); }
-
-/* ════════════════════════════════════════════
-   LETTER REVEAL
-════════════════════════════════════════════ */
-#screen-letter { flex-direction:column; align-items:center; justify-content:center; min-height:100vh; padding:40px 20px; text-align:center; }
-#screen-letter.active { display:flex; }
-.reveal-round { font-size:11px; letter-spacing:5px; text-transform:uppercase; color:var(--text3); font-weight:800; margin-bottom:20px; background:var(--surface); border:1.5px solid var(--border); border-radius:999px; padding:6px 20px; box-shadow:var(--shadow); }
-.letter-huge {
-  font-family:'Bebas Neue',sans-serif;
-  font-size:clamp(130px,30vw,260px); line-height:1;
-  background:linear-gradient(135deg,var(--red),var(--blue));
-  -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text;
-  filter:drop-shadow(0 4px 28px rgba(37,99,235,.22));
-  animation:letterPop .6s cubic-bezier(.34,1.56,.64,1);
-}
-@keyframes letterPop { 0%{transform:scale(0) rotate(-10deg);opacity:0} 100%{transform:scale(1) rotate(0);opacity:1} }
-.cat-pills { display:flex; flex-wrap:wrap; gap:7px; justify-content:center; max-width:560px; margin:22px 0; }
-.cat-pill { background:var(--surface); border:1.5px solid var(--border); padding:5px 14px; border-radius:999px; font-size:12px; font-weight:700; color:var(--text2); box-shadow:var(--shadow); }
-.btn-ready {
-  padding:16px 54px;
-  background:linear-gradient(135deg,var(--blue),var(--blue-dk));
-  border:none; border-radius:13px;
-  font-family:'Bebas Neue',sans-serif; font-size:24px; letter-spacing:3px;
-  color:#fff; cursor:pointer; transition:all .3s;
-  box-shadow:0 6px 20px rgba(37,99,235,.32);
-}
-.btn-ready:hover { transform:translateY(-2px); box-shadow:0 10px 28px rgba(37,99,235,.48); }
-.btn-ready:disabled { opacity:.5; cursor:not-allowed; transform:none; }
-
-/* ════════════════════════════════════════════
-   PLAYING — NOTEBOOK BOARD
-════════════════════════════════════════════ */
-#screen-playing { max-width:700px; margin:0 auto; padding:16px 16px 90px; }
-.play-top { display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; flex-wrap:nowrap; gap:10px; }
-.play-top-left { display:flex; align-items:center; gap:14px; min-width:0; }
-.play-top-right {
-  display:flex;
-  align-items:center;
-  gap:8px;
-  flex-wrap:nowrap;
-  justify-content:flex-end;
-  flex-shrink:0;
-}
-.play-letter-big {
-  font-family:'Bebas Neue',sans-serif; font-size:58px; line-height:1;
-  background:linear-gradient(135deg,var(--red),var(--blue));
-  -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text;
-}
-.score-badge {
-  display:flex; flex-direction:column; align-items:center;
-  background:var(--navy); border-radius:14px; padding:8px 22px;
-  box-shadow:0 4px 18px rgba(30,58,95,.28);
-  flex-shrink:0;
-}
-.score-label { font-size:9px; letter-spacing:3px; text-transform:uppercase; color:rgba(255,255,255,.45); font-weight:800; }
-.score-val { font-family:'Bebas Neue',sans-serif; font-size:30px; color:#fff; line-height:1.1; }
-.room-code-badge {
-  font-family:'Bebas Neue',sans-serif; font-size:13px; letter-spacing:3px;
-  color:var(--muted); background:var(--surface); border:1.5px solid var(--border);
-  border-radius:8px; padding:5px 10px; box-shadow:var(--shadow);
-}
-.play-meta-col {
-  display:flex;
-  flex-direction:row;
-  align-items:center;
-  flex-wrap:nowrap;
-  gap:6px;
-  width:auto;
-  flex-shrink:0;
-}
-.play-meta-col .room-code-badge,
-.play-meta-col .btn-leave-room-top {
-  min-height:36px;
-  display:inline-flex;
-  align-items:center;
-  justify-content:center;
-}
-.play-meta-col .room-code-badge {
-  min-width:76px;
-  text-align:center;
-}
-.btn-leave-room-top {
-  width:36px;
-  min-width:36px;
-  padding:0;
-  background:var(--surface);
-  border:1.5px solid var(--border2);
-  border-radius:8px;
-  font-size:19px;
-  line-height:1;
-  color:var(--text3);
-  cursor:pointer;
+.custom-cat-row { display:flex;gap:8px;margin-bottom:4px; }
+.custom-cat-row input { flex:1;width:auto;font-size:13px;padding:10px 14px; }
+.btn-add-cat {
+  padding:10px 16px;background:var(--accent);border:none;
+  border-radius:10px;color:white;font-family:'Nunito',sans-serif;
+  font-weight:800;font-size:13px;cursor:pointer;white-space:nowrap;
   transition:all .2s;
 }
-.btn-leave-room-top:hover {
-  border-color:var(--red);
-  color:var(--red);
+.btn-add-cat:hover { background:#6d28d9;transform:scale(1.02); }
+
+.rounds-row { display:flex;gap:8px;flex-wrap:wrap; }
+.round-opt {
+  padding:9px 18px;background:var(--card2);border:1.5px solid var(--border);
+  border-radius:10px;color:var(--muted);font-family:'Nunito',sans-serif;
+  font-weight:800;font-size:13px;cursor:pointer;transition:all .2s;
+}
+.round-opt.sel { border-color:var(--accent);background:rgba(124,58,237,0.10);color:var(--accent); }
+
+/* ── JOIN ROOM ───────────────────────────── */
+#screen-join { max-width:420px;margin:0 auto;padding:40px 20px;text-align:center; }
+.code-input {
+  font-size:28px !important;letter-spacing:8px;text-align:center;
+  text-transform:uppercase;font-family:'Bebas Neue',sans-serif !important;
 }
 
-.players-bar { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px; }
-.player-dot {
-  display:flex; align-items:center; gap:6px;
-  background:var(--surface); border:2px solid; border-radius:999px; padding:5px 12px;
-  font-size:12px; font-weight:800; box-shadow:var(--shadow);
+/* ── WAITING ROOM ────────────────────────── */
+#screen-waiting { max-width:500px;margin:0 auto;padding:30px 20px;text-align:center; }
+.room-code-big {
+  font-family:'Bebas Neue',sans-serif;font-size:clamp(60px,15vw,110px);
+  letter-spacing:10px;color:var(--accent);
+  filter:drop-shadow(0 0 20px rgba(124,58,237,0.25));
+  animation:pulse 2.5s infinite;
 }
-.player-dot.me { outline:2px solid var(--red); outline-offset:2px; }
-.dot-emoji { font-size:16px; }
-.dot-name { font-size:11px; color:var(--text2); }
-.dot-score { font-family:'Bebas Neue',sans-serif; font-size:16px; margin-left:2px; }
+@keyframes pulse {
+  0%,100% { filter:drop-shadow(0 0 10px rgba(124,58,237,0.2)); }
+  50%      { filter:drop-shadow(0 0 36px rgba(124,58,237,0.45)); }
+}
+.room-share-hint {
+  font-size:12px;color:var(--muted);letter-spacing:2px;
+  text-transform:uppercase;font-weight:800;margin-bottom:8px;
+}
+.room-info-badge {
+  display:inline-block;background:var(--card);border:1.5px solid var(--border);
+  border-radius:999px;padding:5px 16px;font-size:12px;
+  color:var(--muted);font-weight:700;margin-bottom:24px;
+  box-shadow:var(--shadow);
+}
+.waiting-players { display:flex;flex-direction:column;gap:8px;margin-bottom:20px;text-align:left; }
+.waiting-player {
+  display:flex;align-items:center;gap:12px;
+  background:var(--card);border:1.5px solid var(--border);
+  border-radius:12px;padding:12px 16px;
+  animation:slideIn .3s ease;
+  box-shadow:var(--shadow);
+}
+.waiting-player.me { border-color:var(--accent);background:rgba(124,58,237,0.04); }
+.w-avatar { width:38px;height:38px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0; }
+.w-name { flex:1;font-size:14px;font-weight:800;color:var(--text); }
+.host-badge { background:rgba(217,119,6,0.12);border:1px solid rgba(217,119,6,0.3);border-radius:999px;padding:3px 10px;font-size:11px;font-weight:800;color:var(--gold); }
+
+/* ── LETTER REVEAL ───────────────────────── */
+#screen-letter {
+  display:flex;flex-direction:column;align-items:center;
+  justify-content:center;min-height:100vh;padding:40px 20px;text-align:center;
+}
+.reveal-round {
+  font-size:11px;letter-spacing:5px;text-transform:uppercase;
+  color:var(--muted);font-weight:800;margin-bottom:24px;
+  background:var(--card);border:1.5px solid var(--border);
+  border-radius:999px;padding:6px 18px;box-shadow:var(--shadow);
+}
+.letter-huge {
+  font-family:'Bebas Neue',sans-serif;
+  font-size:clamp(130px,30vw,260px);line-height:1;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+  filter:drop-shadow(0 6px 32px rgba(124,58,237,0.3));
+  animation:letterPop .6s cubic-bezier(.34,1.56,.64,1);
+}
+@keyframes letterPop { 0%{transform:scale(0)rotate(-10deg);opacity:0}100%{transform:scale(1)rotate(0);opacity:1} }
+.cat-pills { display:flex;flex-wrap:wrap;gap:7px;justify-content:center;max-width:560px;margin:24px 0; }
+.cat-pill {
+  background:var(--card);border:1.5px solid var(--border);
+  padding:5px 14px;border-radius:999px;font-size:12px;font-weight:700;color:var(--text2);
+  box-shadow:var(--shadow);
+}
+.btn-ready {
+  padding:16px 54px;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));
+  border:none;border-radius:14px;
+  font-family:'Bebas Neue',sans-serif;font-size:24px;letter-spacing:3px;
+  color:white;cursor:pointer;transition:all .3s;
+  box-shadow:0 8px 28px rgba(124,58,237,0.30);
+}
+.btn-ready:hover { transform:translateY(-2px);box-shadow:0 12px 36px rgba(124,58,237,0.50); }
+.btn-ready:disabled { opacity:.5;cursor:not-allowed;transform:none; }
+
+/* ── PLAYING SCREEN ──────────────────────── */
+#screen-playing { max-width:700px;margin:0 auto;padding:16px 16px 80px; }
+
+.play-top {
+  display:flex;align-items:center;justify-content:space-between;
+  margin-bottom:14px;flex-wrap:wrap;gap:10px;
+}
+.play-letter-big {
+  font-family:'Bebas Neue',sans-serif;font-size:54px;line-height:1;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+}
+
+/* Score display replaces timer */
+.my-score-badge {
+  display:flex;flex-direction:column;align-items:center;
+  background:linear-gradient(135deg,rgba(124,58,237,0.10),rgba(255,107,53,0.08));
+  border:1.5px solid var(--border);border-radius:14px;
+  padding:8px 18px;
+  box-shadow:var(--shadow);
+}
+.my-score-label { font-size:9px;letter-spacing:3px;font-weight:900;text-transform:uppercase;color:var(--muted); }
+.my-score-val { font-family:'Bebas Neue',sans-serif;font-size:28px;color:var(--accent);line-height:1; }
+
+.players-bar { display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px; }
+.player-dot {
+  display:flex;align-items:center;gap:6px;
+  border-radius:999px;padding:5px 12px;font-size:12px;font-weight:800;
+  background:var(--card);box-shadow:var(--shadow);
+}
+.player-dot.me { outline:2px solid var(--accent);outline-offset:2px; }
+.dot-name { font-size:11px;color:var(--text2); }
+.dot-score {
+  font-family:'Bebas Neue',sans-serif;font-size:15px;color:var(--accent);
+  background:rgba(124,58,237,0.08);border-radius:999px;padding:1px 8px;margin-left:2px;
+}
 
 .stop-banner {
-  display:none; align-items:center; justify-content:center; gap:12px;
-  background:linear-gradient(135deg,var(--red),var(--red-dk));
-  border-radius:12px; padding:14px; margin-bottom:14px;
-  font-family:'Bebas Neue',sans-serif; font-size:22px; letter-spacing:3px; color:#fff;
-  animation:shake .4s ease; box-shadow:0 4px 18px rgba(230,57,70,.38);
+  display:none;align-items:center;justify-content:center;gap:10px;
+  background:linear-gradient(135deg,var(--red),#b91c1c);
+  border-radius:12px;padding:14px;margin-bottom:14px;
+  font-family:'Bebas Neue',sans-serif;font-size:22px;letter-spacing:3px;
+  color:white;
+  animation:shake .4s ease;
+  box-shadow:0 4px 20px rgba(220,38,38,0.30);
 }
 
-/* ── NOTEBOOK ─────────────────────────────── */
 .board-wrap {
-  position:relative; border-radius:16px; overflow:hidden; margin-bottom:14px;
-  background:
-    repeating-linear-gradient(
-      transparent 0px, transparent 39px,
-      rgba(37,99,235,.13) 39px, rgba(37,99,235,.13) 40px
-    ),
-    linear-gradient(90deg,
-      transparent 119px,
-      rgba(230,57,70,.20) 119px, rgba(230,57,70,.20) 121px,
-      transparent 121px
-    ),
-    #fdfcf6;
-  border:1.5px solid #ccc5a0;
-  box-shadow:2px 3px 14px rgba(0,0,0,.10), 0 1px 0 rgba(255,255,255,.8) inset;
-}
-.board-wrap::before {
-  content:''; position:absolute; left:0; top:0; bottom:0; width:22px; z-index:2; pointer-events:none;
-  background:
-    radial-gradient(circle at 11px 26px,  #f1f5f9 5.5px, transparent 5.5px),
-    radial-gradient(circle at 11px 26px,  #94a3b8 7px,   transparent 7px),
-    radial-gradient(circle at 11px 66px,  #f1f5f9 5.5px, transparent 5.5px),
-    radial-gradient(circle at 11px 66px,  #94a3b8 7px,   transparent 7px),
-    radial-gradient(circle at 11px 106px, #f1f5f9 5.5px, transparent 5.5px),
-    radial-gradient(circle at 11px 106px, #94a3b8 7px,   transparent 7px),
-    radial-gradient(circle at 11px 146px, #f1f5f9 5.5px, transparent 5.5px),
-    radial-gradient(circle at 11px 146px, #94a3b8 7px,   transparent 7px),
-    radial-gradient(circle at 11px 186px, #f1f5f9 5.5px, transparent 5.5px),
-    radial-gradient(circle at 11px 186px, #94a3b8 7px,   transparent 7px),
-    radial-gradient(circle at 11px 226px, #f1f5f9 5.5px, transparent 5.5px),
-    radial-gradient(circle at 11px 226px, #94a3b8 7px,   transparent 7px),
-    radial-gradient(circle at 11px 266px, #f1f5f9 5.5px, transparent 5.5px),
-    radial-gradient(circle at 11px 266px, #94a3b8 7px,   transparent 7px),
-    radial-gradient(circle at 11px 306px, #f1f5f9 5.5px, transparent 5.5px),
-    radial-gradient(circle at 11px 306px, #94a3b8 7px,   transparent 7px),
-    radial-gradient(circle at 11px 346px, #f1f5f9 5.5px, transparent 5.5px),
-    radial-gradient(circle at 11px 346px, #94a3b8 7px,   transparent 7px),
-    linear-gradient(90deg, rgba(0,0,0,.04), transparent 100%);
+  background:var(--card);border:1.5px solid var(--border);
+  border-radius:16px;overflow:hidden;margin-bottom:14px;
+  box-shadow:var(--shadow);
 }
 .board-head {
-  background:rgba(255,255,255,.88); padding:11px 16px 11px 28px;
-  display:flex; align-items:center; gap:10px;
-  border-bottom:2px solid rgba(37,99,235,.14); position:relative; z-index:1;
+  background:linear-gradient(135deg,rgba(124,58,237,0.06),rgba(255,107,53,0.04));
+  padding:12px 18px;
+  display:flex;align-items:center;gap:10px;
+  border-bottom:1.5px solid var(--border);
 }
-.board-me-av { width:34px; height:34px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:18px; flex-shrink:0; }
-.board-me-nm { font-family:'Caveat',cursive; font-size:20px; font-weight:600; color:var(--navy); }
+.board-me-av {
+  width:34px;height:34px;border-radius:50%;
+  display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0;
+}
+.board-me-nm { font-size:15px;font-weight:900;color:var(--text); }
+
 .board-row {
-  display:flex; align-items:center;
-  border-bottom:1px solid rgba(37,99,235,.09); position:relative; z-index:1;
+  display:flex;align-items:center;
+  border-bottom:1px solid var(--border);
+  transition:background .15s;
 }
 .board-row:last-child { border-bottom:none; }
-.board-row:focus-within { background:rgba(255,255,220,.55); }
+.board-row:focus-within { background:rgba(124,58,237,0.03); }
 .board-cat {
-  width:122px; min-width:122px; padding:10px 6px 10px 28px;
-  font-size:10px; font-weight:900; text-transform:uppercase; letter-spacing:.8px;
-  color:rgba(230,57,70,.65); border-right:2px dashed rgba(37,99,235,.15);
-  display:flex; flex-direction:column; gap:1px;
+  width:120px;min-width:120px;padding:11px 14px;
+  font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:1px;
+  color:var(--muted);border-right:1px solid var(--border);
 }
 .ans-input {
-  flex:1; background:transparent; border:none; outline:none;
-  color:var(--navy); font-family:'Caveat',cursive;
-  font-size:20px; font-weight:600; padding:7px 14px; width:100%; letter-spacing:.3px;
+  flex:1;background:transparent;border:none;outline:none;
+  color:var(--text);font-family:'Nunito',sans-serif;
+  font-size:15px;font-weight:700;padding:11px 14px;width:100%;
 }
-.ans-input::placeholder { color:rgba(148,163,184,.45); font-size:16px; }
-.ans-input.valid   { color:#1d4ed8; }
+.ans-input::placeholder { color:rgba(139,128,176,.5); }
+.ans-input.valid   { color:var(--green); }
 .ans-input.invalid { color:var(--red); }
-.ans-input:disabled { opacity:.65; cursor:not-allowed; }
+.ans-input:disabled { opacity:.6;cursor:not-allowed; }
 
-.action-row { display:flex; gap:10px; margin-bottom:10px; }
+.action-row { display:flex;gap:10px;margin-bottom:10px; }
+
 .btn-stop {
-  flex:2; padding:16px;
-  background:linear-gradient(135deg,var(--red),var(--red-dk));
-  border:none; border-radius:13px;
-  font-family:'Bebas Neue',sans-serif; font-size:28px; letter-spacing:6px;
-  color:#fff; cursor:pointer; transition:all .3s;
-  box-shadow:0 5px 18px rgba(230,57,70,.33); animation:stopPulse 2s infinite;
+  flex:2;padding:17px;
+  background:linear-gradient(135deg,var(--red),#b91c1c);
+  border:none;border-radius:14px;
+  font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:6px;
+  color:white;cursor:pointer;transition:all .3s;
+  box-shadow:0 6px 24px rgba(220,38,38,0.25);
+  animation:pulseStop 2s infinite;
 }
-.btn-stop:hover { transform:scale(1.02); animation:none; box-shadow:0 8px 28px rgba(230,57,70,.55); }
-@keyframes stopPulse { 0%,100%{box-shadow:0 5px 18px rgba(230,57,70,.33)} 50%{box-shadow:0 5px 34px rgba(230,57,70,.60)} }
-.btn-save { flex:1; padding:16px; background:var(--surface); border:2px solid var(--border2); border-radius:13px; font-family:'Nunito',sans-serif; font-weight:900; font-size:14px; color:var(--text3); cursor:pointer; transition:all .2s; }
-.btn-save:hover { border-color:var(--blue); color:var(--blue); }
-.btn-save:disabled { opacity:.5; cursor:default; }
+.btn-stop:hover { transform:scale(1.02);animation:none;box-shadow:0 12px 36px rgba(220,38,38,0.5); }
+@keyframes pulseStop { 0%,100%{box-shadow:0 6px 24px rgba(220,38,38,0.25)}50%{box-shadow:0 6px 40px rgba(220,38,38,0.5)} }
 
-/* ════════════════════════════════════════════
-   SCORING — with horizontal scroll on table only
-════════════════════════════════════════════ */
-#screen-scoring { max-width:900px; margin:0 auto; padding:20px; }
-.scoring-hdl { font-family:'Bebas Neue',sans-serif; font-size:38px; letter-spacing:3px; text-align:center; margin-bottom:4px; color:var(--navy); }
-.scoring-sub { text-align:center; font-size:11px; letter-spacing:2px; text-transform:uppercase; color:var(--muted); font-weight:800; margin-bottom:20px; }
-.rival-col { font-size:10px; color:var(--blue); font-style:normal; font-weight:800; display:block; letter-spacing:1px; margin-top:2px; }
-.you-col   { font-size:10px; color:var(--muted); font-style:normal; font-weight:700; display:block; margin-top:2px; }
+.btn-save {
+  flex:1;padding:17px;
+  background:var(--card2);border:1.5px solid var(--border);
+  border-radius:14px;font-family:'Nunito',sans-serif;
+  font-weight:900;font-size:14px;color:var(--muted);
+  cursor:pointer;transition:all .2s;
+}
+.btn-save:hover { border-color:var(--green);color:var(--green); }
+.btn-save:disabled { opacity:.5;cursor:default; }
 
-/* Scroll wrapper — only scrolls when content overflows */
-.scoring-scroll-wrap {
-  overflow-x: auto;
-  overflow-y: visible;
-  margin-bottom: 4px;
-  /* Custom scrollbar styling */
-  scrollbar-width: thin;
-  scrollbar-color: var(--border2) transparent;
-  border-radius: 0 0 14px 14px;
-  /* Required for sticky children */
-  position: relative;
+/* ── SCORING ─────────────────────────────── */
+#screen-scoring { max-width:900px;margin:0 auto;padding:20px; }
+.scoring-hdl {
+  font-family:'Bebas Neue',sans-serif;font-size:36px;
+  letter-spacing:3px;text-align:center;margin-bottom:8px;color:var(--accent);
 }
-.scoring-scroll-wrap::-webkit-scrollbar {
-  height: 6px;
-}
-.scoring-scroll-wrap::-webkit-scrollbar-track {
-  background: transparent;
-}
-.scoring-scroll-wrap::-webkit-scrollbar-thumb {
-  background: var(--border2);
-  border-radius: 99px;
-}
-.scoring-scroll-wrap::-webkit-scrollbar-thumb:hover {
-  background: var(--muted);
+.scoring-subtitle {
+  text-align:center;font-size:12px;letter-spacing:2px;text-transform:uppercase;
+  color:var(--muted);font-weight:800;margin-bottom:20px;
 }
 
-/* Inner table: min-width grows with player count */
-#scoring-table {
-  /* min-width: category col (140px) + 160px per player, min 400px */
-  min-width: 400px;
+.st-head-row {
+  display:flex;background:linear-gradient(135deg,rgba(124,58,237,0.06),rgba(255,107,53,0.04));
+  border-radius:16px 16px 0 0;border:1.5px solid var(--border);
+  border-bottom:none;overflow:hidden;
 }
-
-.st-head-row { display:flex; background:var(--surface2); border-radius:14px 14px 0 0; border:1.5px solid var(--border); border-bottom:none; overflow:hidden; }
-.st-head-cat { width:140px; min-width:140px; padding:12px; font-size:9px; font-weight:900; text-transform:uppercase; letter-spacing:2px; color:var(--muted); border-right:2px solid var(--border2); flex-shrink:0; position:sticky; left:0; z-index:3; background:var(--surface2); box-shadow:2px 0 8px rgba(0,0,0,.06); }
-.st-head-p { flex:1; min-width:130px; padding:10px 8px; text-align:center; font-size:18px; font-weight:900; border-right:1px solid var(--border); color:var(--text); }
+.st-head-cat {
+  width:140px;min-width:140px;padding:12px;
+  font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:2px;color:var(--muted);
+  border-right:1px solid var(--border);
+}
+.st-head-p {
+  flex:1;padding:10px 8px;text-align:center;
+  font-size:18px;font-weight:900;border-right:1px solid var(--border);
+  color:var(--text);
+}
 .st-head-p:last-child { border-right:none; }
-.st-head-p span { display:block; font-size:12px; font-weight:800; margin-top:2px; color:var(--text2); }
-.st-row { display:flex; border:1.5px solid var(--border); border-top:none; background:var(--surface); transition:background .15s; }
-.st-row:hover { background:rgba(37,99,235,.02); }
-.st-cat-cell { width:140px; min-width:140px; padding:10px 12px; font-size:10px; font-weight:900; text-transform:uppercase; letter-spacing:.5px; color:var(--text3); background:var(--surface2); border-right:2px solid var(--border2); display:flex; align-items:center; gap:5px; flex-shrink:0; position:sticky; left:0; z-index:3; box-shadow:2px 0 8px rgba(0,0,0,.06); }
-.st-cell { flex:1; min-width:130px; padding:8px 10px; border-right:1px solid var(--border); display:flex; flex-direction:column; gap:4px; }
+.st-head-p span { display:block;font-size:12px;font-weight:800;margin-top:2px;color:var(--text2); }
+.you-tag { display:block;font-size:10px;color:var(--muted);font-weight:700; }
+
+.st-row {
+  display:flex;border:1.5px solid var(--border);border-top:none;
+  transition:background .15s;background:var(--card);
+}
+.st-row:hover { background:rgba(124,58,237,0.02); }
+.st-cat-cell {
+  width:140px;min-width:140px;padding:10px 12px;
+  font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.5px;
+  color:var(--muted);background:var(--card2);border-right:1px solid var(--border);
+  display:flex;align-items:center;gap:6px;
+}
+.st-cell {
+  flex:1;padding:8px 10px;border-right:1px solid var(--border);
+  display:flex;flex-direction:column;gap:4px;
+}
 .st-cell:last-child { border-right:none; }
-.st-ans { font-size:13px; font-weight:700; font-style:italic; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--text); }
-.st-ans.empty { color:var(--red); font-style:normal; opacity:.5; }
-.st-sel { background:var(--surface2); border:1.5px solid; border-radius:6px; color:var(--text); font-family:'Nunito',sans-serif; font-size:10px; font-weight:800; padding:3px 6px; cursor:pointer; outline:none; width:100%; transition:border-color .15s; }
-.st-pts-badge { font-size:11px; font-weight:900; padding:3px 8px; border-radius:999px; text-align:center; }
-.pts-label { display:block; font-size:9px; font-weight:700; letter-spacing:1px; margin-top:1px; color:var(--muted); font-style:normal; }
-.pts-100 { border-color:var(--green)!important; color:var(--green); }
-.pts-50  { border-color:var(--gold)!important;  color:var(--gold); }
-.pts-25  { border-color:#f97316!important;       color:#f97316; }
-.pts-0   { border-color:var(--red)!important;   color:var(--red); }
-.st-pts-badge.pts-100 { background:rgba(5,150,105,.08); }
-.st-pts-badge.pts-50  { background:rgba(217,119,6,.08); }
-.st-pts-badge.pts-25  { background:rgba(249,115,22,.08); }
-.st-pts-badge.pts-0   { background:rgba(230,57,70,.08); }
-.ans-scored-pts-100 { color:var(--green)!important; font-weight:900; }
-.ans-scored-pts-50  { color:var(--gold)!important;  font-weight:900; }
-.ans-scored-pts-25  { color:#f97316!important;       font-weight:900; }
-.ans-scored-pts-0   { color:var(--red)!important; text-decoration:line-through; opacity:.6; }
-.st-total-row { display:flex; background:var(--navy); overflow:hidden; }
-.st-total-lbl { width:140px; min-width:140px; padding:14px 12px; font-size:10px; font-weight:900; text-transform:uppercase; letter-spacing:2px; color:rgba(255,255,255,.45); border-right:2px solid rgba(255,255,255,.15); flex-shrink:0; position:sticky; left:0; z-index:3; background:var(--navy); box-shadow:2px 0 8px rgba(0,0,0,.18); }
-.st-total-val { flex:1; min-width:130px; padding:12px; text-align:center; font-family:'Bebas Neue',sans-serif; font-size:24px; color:#fff; border-right:1px solid rgba(255,255,255,.1); }
+.st-ans {
+  font-size:12px;font-weight:700;font-style:italic;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text);
+}
+.st-ans.empty { color:var(--red);font-style:normal;opacity:.5; }
+
+.st-sel {
+  background:var(--card2);border:1.5px solid var(--border);
+  border-radius:6px;color:var(--text);font-family:'Nunito',sans-serif;
+  font-size:10px;font-weight:800;padding:3px 6px;cursor:pointer;outline:none;width:100%;
+  transition:border-color .2s;
+}
+.st-sel:focus { border-color:var(--accent); }
+.st-pts-badge {
+  font-size:11px;font-weight:900;padding:2px 8px;border-radius:999px;text-align:center;
+}
+.own-score { position:relative; }
+.own-tag {
+  display:block;font-size:9px;letter-spacing:1px;text-transform:uppercase;
+  color:var(--muted);font-weight:700;margin-top:1px;font-style:normal;
+}
+
+.pts-100 { border-color:var(--green) !important;color:var(--green); }
+.pts-50  { border-color:var(--gold)  !important;color:var(--gold); }
+.pts-25  { border-color:#f97316      !important;color:#f97316; }
+.pts-0   { border-color:var(--red)   !important;color:var(--red); }
+.st-pts-badge.pts-100 { background:rgba(5,150,105,0.10); }
+.st-pts-badge.pts-50  { background:rgba(217,119,6,0.10); }
+.st-pts-badge.pts-25  { background:rgba(249,115,22,0.10); }
+.st-pts-badge.pts-0   { background:rgba(220,38,38,0.10); }
+
+.st-total-row {
+  display:flex;background:var(--card2);
+  border:1.5px solid var(--border);border-top:none;
+  border-radius:0 0 16px 16px;overflow:hidden;
+}
+.st-total-lbl {
+  width:140px;min-width:140px;padding:14px 12px;
+  font-size:11px;font-weight:900;text-transform:uppercase;letter-spacing:2px;
+  color:var(--accent);border-right:1px solid var(--border);
+}
+.st-total-val {
+  flex:1;padding:12px;text-align:center;
+  font-family:'Bebas Neue',sans-serif;font-size:22px;color:var(--accent);
+  border-right:1px solid var(--border);
+}
 .st-total-val:last-child { border-right:none; }
-.st-acc-row { display:flex; background:linear-gradient(135deg,var(--red),var(--red-dk)); border-radius:0 0 14px 14px; overflow:hidden; }
-.st-acc-lbl { width:140px; min-width:140px; padding:14px 12px; font-size:10px; font-weight:900; text-transform:uppercase; letter-spacing:2px; color:rgba(255,255,255,.65); border-right:2px solid rgba(255,255,255,.15); flex-shrink:0; position:sticky; left:0; z-index:3; background:var(--red); box-shadow:2px 0 8px rgba(0,0,0,.18); }
-.st-acc-val { flex:1; min-width:130px; padding:12px; text-align:center; font-family:'Bebas Neue',sans-serif; font-size:26px; color:#fff; border-right:1px solid rgba(255,255,255,.15); font-weight:900; }
-.st-acc-val:last-child { border-right:none; }
-.scoring-note { font-size:11px; color:var(--muted); padding:10px 4px; font-weight:700; }
-.waiting-next { text-align:center; padding:16px; color:var(--muted); font-size:14px; font-weight:700; background:var(--surface); border:1.5px solid var(--border); border-radius:12px; margin-top:14px; box-shadow:var(--shadow); }
-.btn-next { width:100%; padding:16px; background:linear-gradient(135deg,var(--navy),var(--blue)); border:none; border-radius:13px; font-family:'Bebas Neue',sans-serif; font-size:24px; letter-spacing:3px; color:#fff; cursor:pointer; transition:all .3s; box-shadow:0 6px 20px rgba(30,58,95,.28); margin-top:16px; }
-.btn-next:hover { transform:translateY(-2px); box-shadow:0 10px 28px rgba(30,58,95,.44); }
-.btn-ready-next { width:100%; padding:16px; background:linear-gradient(135deg,var(--green),#047857); border:none; border-radius:13px; font-family:'Bebas Neue',sans-serif; font-size:22px; letter-spacing:2px; color:#fff; cursor:pointer; transition:all .3s; box-shadow:0 6px 20px rgba(5,150,105,.28); margin-top:16px; display:none; }
-.btn-ready-next:hover:not(:disabled) { transform:translateY(-2px); box-shadow:0 10px 28px rgba(5,150,105,.44); }
-.btn-ready-next:disabled { cursor:not-allowed; }
-.ready-count-badge { text-align:center; font-size:13px; font-weight:800; color:var(--green); background:rgba(5,150,105,.08); border:1.5px solid rgba(5,150,105,.25); border-radius:10px; padding:8px 16px; margin-top:12px; }
 
-/* ════════════════════════════════════════════
-   RESULTS
-════════════════════════════════════════════ */
-#screen-results { max-width:600px; margin:0 auto; padding:34px 20px; text-align:center; }
-.winner-crown { font-size:50px; display:block; animation:letterPop .6s cubic-bezier(.34,1.56,.64,1) both; }
-.winner-banner-txt { font-family:'Bebas Neue',sans-serif; font-size:clamp(32px,7vw,60px); background:linear-gradient(135deg,var(--red),var(--blue)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; animation:fadeDown .5s ease; }
-.winner-emoji-big { font-size:66px; display:block; animation:letterPop .7s cubic-bezier(.34,1.56,.64,1) .1s both; }
-.winner-name-big { font-family:'Bebas Neue',sans-serif; font-size:clamp(48px,12vw,100px); background:linear-gradient(135deg,var(--navy),var(--blue)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; animation:letterPop .7s cubic-bezier(.34,1.56,.64,1) .2s both; }
-.winner-score-lbl { font-size:18px; font-weight:900; color:var(--gold); margin-bottom:6px; animation:fadeIn .5s .35s both; }
-.winner-msg { font-size:14px; font-weight:700; margin-bottom:28px; animation:fadeIn .5s .45s both; }
-.podium { display:flex; align-items:flex-end; justify-content:center; gap:10px; margin:32px 0; }
-.podium-place { display:flex; flex-direction:column; align-items:center; gap:6px; animation:fadeIn .5s ease both; }
-.podium-me { filter:drop-shadow(0 0 12px rgba(37,99,235,.35)); }
-.pod-name { font-size:12px; font-weight:900; text-align:center; max-width:90px; color:var(--text); }
-.pod-block { width:82px; border-radius:12px 12px 0 0; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:10px 6px; gap:4px; box-shadow:var(--shadow-lg); }
-.pod-pts { font-size:12px; color:rgba(0,0,0,.55); font-family:'Bebas Neue',sans-serif; letter-spacing:1px; }
-.leaderboard { background:var(--surface); border:1.5px solid var(--border); border-radius:var(--radius); overflow:hidden; margin-bottom:22px; text-align:left; box-shadow:var(--shadow); }
-.lb-row { display:flex; align-items:center; gap:12px; padding:13px 18px; border-bottom:1px solid var(--border); transition:background .2s; animation:fadeIn .4s ease both; }
+.waiting-next {
+  text-align:center;padding:16px;
+  color:var(--muted);font-size:14px;font-weight:700;
+  background:var(--card);border:1.5px solid var(--border);border-radius:14px;
+  margin-top:14px;box-shadow:var(--shadow);
+}
+
+.btn-next {
+  width:100%;padding:17px;
+  background:linear-gradient(135deg,var(--accent),#a855f7);
+  border:none;border-radius:14px;
+  font-family:'Bebas Neue',sans-serif;font-size:24px;letter-spacing:3px;
+  color:white;cursor:pointer;transition:all .3s;
+  box-shadow:0 8px 28px rgba(124,58,237,0.30);
+  margin-top:16px;
+}
+.btn-next:hover { transform:translateY(-2px);box-shadow:0 12px 36px rgba(124,58,237,0.50); }
+
+/* ── RESULTS ─────────────────────────────── */
+#screen-results { max-width:600px;margin:0 auto;padding:30px 20px;text-align:center; }
+.winner-banner-txt {
+  font-family:'Bebas Neue',sans-serif;font-size:clamp(34px,7vw,64px);
+  background:linear-gradient(135deg,var(--accent),var(--accent2));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+  animation:fadeDown .5s ease;
+}
+.winner-emoji-big { font-size:64px;animation:letterPop .7s cubic-bezier(.34,1.56,.64,1) .1s both;display:block; }
+.winner-name-big {
+  font-family:'Bebas Neue',sans-serif;font-size:clamp(46px,12vw,100px);
+  background:linear-gradient(135deg,var(--accent),var(--accent2));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+  filter:drop-shadow(0 4px 20px rgba(124,58,237,0.25));
+  animation:letterPop .7s cubic-bezier(.34,1.56,.64,1) .2s both;
+}
+.winner-score-sub {
+  font-size:16px;font-weight:900;color:var(--gold);margin-bottom:8px;
+  animation:fadeIn .5s ease .3s both;
+}
+.winner-message {
+  font-size:14px;font-weight:700;margin-bottom:24px;
+  animation:fadeIn .5s ease .4s both;
+}
+
+.podium { display:flex;align-items:flex-end;justify-content:center;gap:10px;margin:36px 0; }
+.podium-place { display:flex;flex-direction:column;align-items:center;gap:6px;animation:fadeIn .5s ease both; }
+.podium-me { transform:scale(1.03); }
+.pod-name { font-size:12px;font-weight:900;text-align:center;max-width:90px;color:var(--text); }
+.pod-block {
+  width:82px;border-radius:12px 12px 0 0;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  padding:10px 6px;gap:4px;
+  box-shadow:var(--shadow-lg);
+}
+
+.leaderboard {
+  background:var(--card);border:1.5px solid var(--border);
+  border-radius:16px;overflow:hidden;margin-bottom:22px;text-align:left;
+  box-shadow:var(--shadow);
+}
+.lb-row {
+  display:flex;align-items:center;gap:12px;
+  padding:13px 18px;border-bottom:1px solid var(--border);transition:background .2s;
+}
 .lb-row:last-child { border-bottom:none; }
-.lb-row.me { background:rgba(230,57,70,.04); border-left:3px solid var(--red); }
-.lb-rank { font-family:'Bebas Neue',sans-serif; font-size:22px; color:var(--muted); width:28px; }
-.lb-name { flex:1; font-size:15px; font-weight:900; }
-.lb-pts  { font-family:'Bebas Neue',sans-serif; font-size:26px; color:var(--navy); }
-.play-again-hint { color:var(--muted); font-size:13px; font-weight:700; padding:14px; background:var(--surface); border:1.5px solid var(--border); border-radius:12px; box-shadow:var(--shadow); }
+.lb-row:hover { background:rgba(124,58,237,0.02); }
+.lb-row.me { background:rgba(124,58,237,0.05);border-left:3px solid var(--accent); }
+.lb-rank { font-family:'Bebas Neue',sans-serif;font-size:22px;color:var(--muted);width:28px; }
+.lb-name { flex:1;font-size:15px;font-weight:900;color:var(--text); }
+.lb-pts  { font-family:'Bebas Neue',sans-serif;font-size:26px;color:var(--accent); }
 
-/* ════════════════════════════════════════════
-   ANIMATIONS
-════════════════════════════════════════════ */
-@keyframes fadeDown { from{opacity:0;transform:translateY(-18px)} to{opacity:1;transform:translateY(0)} }
-@keyframes fadeIn   { from{opacity:0;transform:translateY(8px)}   to{opacity:1;transform:translateY(0)} }
-@keyframes slideIn  { from{opacity:0;transform:translateX(-10px)} to{opacity:1;transform:translateX(0)} }
-@keyframes shake    { 0%,100%{transform:translateX(0)} 20%{transform:translateX(-6px)} 40%{transform:translateX(6px)} 60%{transform:translateX(-4px)} 80%{transform:translateX(4px)} }
-.confetti { position:fixed; pointer-events:none; z-index:999; animation:confettiFall linear forwards; }
-@keyframes confettiFall { 0%{transform:translateY(-20px) rotate(0);opacity:1} 100%{transform:translateY(100vh) rotate(720deg);opacity:0} }
+.play-again-hint {
+  color:var(--muted);font-size:13px;font-weight:700;padding:14px;
+  background:var(--card);border:1.5px solid var(--border);border-radius:12px;
+  box-shadow:var(--shadow);
+}
+
+/* ── ANIMATIONS ──────────────────────────── */
+@keyframes fadeDown { from{opacity:0;transform:translateY(-18px)}to{opacity:1;transform:translateY(0)} }
+@keyframes fadeIn   { from{opacity:0;transform:translateY(8px)}  to{opacity:1;transform:translateY(0)} }
+@keyframes slideIn  { from{opacity:0;transform:translateX(-10px)}to{opacity:1;transform:translateX(0)} }
+@keyframes shake    { 0%,100%{transform:translateX(0)}20%{transform:translateX(-6px)}40%{transform:translateX(6px)}60%{transform:translateX(-4px)}80%{transform:translateX(4px)} }
+
+.confetti {
+  position:fixed;pointer-events:none;z-index:999;
+  animation:confettiFall linear forwards;
+}
+@keyframes confettiFall { 0%{transform:translateY(-20px)rotate(0);opacity:1}100%{transform:translateY(100vh)rotate(720deg);opacity:0} }
 
 @media(max-width:600px){
-  .play-meta-col { justify-content:flex-start; }
-  .play-meta-col .room-code-badge,
-  .play-meta-col .btn-leave-room-top {
-    min-height:34px;
-  }
-  .play-meta-col .btn-leave-room-top {
-    width:34px;
-    min-width:34px;
-    font-size:18px;
-  }
-  .play-meta-col .room-code-badge {
-    min-width:72px;
-    padding:4px 8px;
-    letter-spacing:2px;
-  }
-  .score-badge {
-    min-height:34px;
-    padding:6px 14px;
-  }
-  .score-val { font-size:26px; }
-  .board-cat { width:80px; min-width:80px; font-size:9px; padding-left:10px; }
-  .board-wrap::before { display:none; }
-  .st-head-cat,.st-cat-cell,.st-total-lbl,.st-acc-lbl { width:80px; min-width:80px; }
+  .board-cat { width:90px;min-width:90px;font-size:10px; }
+  .st-head-cat,.st-cat-cell,.st-total-lbl { width:90px;min-width:90px; }
   .pod-block { width:68px; }
-  .ans-input { font-size:17px; }
 }
-
-@media(max-width:520px){
-  .play-top { flex-wrap:nowrap; }
-  .play-top-right {
-    width:auto;
-    justify-content:flex-end;
-    flex-wrap:nowrap;
-    gap:6px;
-  }
-  .play-top-left { gap:10px; }
-  .play-letter-big { font-size:52px; }
-  .score-badge { padding:6px 12px; }
-}
-
-@media(max-width:360px){
-  .play-top { flex-wrap:wrap; }
-  .play-top-right {
-    width:100%;
-    justify-content:flex-start;
-    flex-wrap:wrap;
-  }
-}
-
-/* ════════════════════════════════════════════
-   DARK MODE
-════════════════════════════════════════════ */
-body.dark {
-  --bg:       #0f172a;
-  --surface:  #1e293b;
-  --surface2: #162032;
-  --border:   #2d3f55;
-  --border2:  #3a5068;
-  --blue:     #e63946;
-  --blue-dk:  #b91c1c;
-  --navy:     #0f172a;
-  --text:     #f1f5f9;
-  --text2:    #cbd5e1;
-  --text3:    #94a3b8;
-  --muted:    #64748b;
-  --shadow:   0 1px 3px rgba(0,0,0,.3), 0 4px 14px rgba(0,0,0,.4);
-  --shadow-lg:0 4px 6px rgba(0,0,0,.3), 0 10px 36px rgba(0,0,0,.5);
-}
-body.dark .board-wrap {
-  background:
-    repeating-linear-gradient(transparent 0px, transparent 39px, rgba(230,57,70,.18) 39px, rgba(230,57,70,.18) 40px),
-    linear-gradient(90deg, transparent 119px, rgba(230,57,70,.25) 119px, rgba(230,57,70,.25) 121px, transparent 121px),
-    #1a1f2e;
-  border-color:#2d3f55;
-}
-body.dark .board-head { background:rgba(30,41,59,.9); }
-body.dark .ans-input { color:#e2e8f0; }
-body.dark .ans-input.valid { color:#93c5fd; }
-body.dark input[type=text] { background:var(--surface2); color:var(--text); }
-body.dark .modal-box { background:var(--surface); border-color:var(--border); }
-body.dark .modal-msg { color:var(--text2); }
-body.dark .section-label { color:var(--red); }
-
-/* ════════════════════════════════════════════
-   CONFIG BUTTON (floating, top-right all screens)
-════════════════════════════════════════════ */
-.cfg-btn {
-  position:fixed; top:14px; right:14px; z-index:500;
-  width:40px; height:40px;
-  background:var(--surface); border:1.5px solid var(--border);
-  border-radius:50%; font-size:18px; line-height:1;
-  color:var(--text3); cursor:pointer;
-  box-shadow:var(--shadow); transition:all .2s;
-  display:flex; align-items:center; justify-content:center;
-}
-.cfg-btn:hover { border-color:var(--red); color:var(--red); transform:rotate(30deg); }
-
-/* Config modal inner */
-.cfg-section-title {
-  font-size:10px; letter-spacing:4px; text-transform:uppercase;
-  color:var(--blue); font-weight:900; margin:18px 0 10px;
-  text-align:left;
-}
-body.dark .cfg-section-title { color:var(--red); }
-.cfg-options-row { display:flex; gap:8px; }
-.cfg-opt-btn {
-  flex:1; padding:11px 8px;
-  background:var(--surface2); border:1.5px solid var(--border);
-  border-radius:10px; font-family:'Nunito',sans-serif; font-weight:800;
-  font-size:13px; color:var(--text3); cursor:pointer; transition:all .2s;
-  display:flex; flex-direction:column; align-items:center; gap:4px;
-}
-.cfg-opt-btn span.cfg-icon { font-size:22px; }
-.cfg-opt-btn:hover { border-color:var(--red); color:var(--red); }
-.cfg-opt-btn.active { border-color:var(--red); background:rgba(230,57,70,.07); color:var(--red); }
-.cfg-divider { border:none; border-top:1.5px solid var(--border); margin:18px 0 0; }
 </style>
 </head>
 <body>
 
 <!-- ═══ LOGIN ════════════════════════════════ -->
 <div id="screen-login" class="screen active">
-  <div style="max-width:420px;margin:0 auto;padding:44px 20px;text-align:center;">
+  <div style="max-width:420px;margin:0 auto;padding:40px 20px;text-align:center;">
     <div class="login-header">
-      <img src="https://upload.wikimedia.org/wikipedia/commons/8/81/Stop_sign.png" alt="STOP!" class="logo-img">
+      <div class="logo-big">STOP!</div>
       <div class="logo-sub">Multijugador en red</div>
     </div>
+
     <div class="card" style="text-align:left;">
       <div class="section-label">Tu avatar</div>
       <div style="text-align:center;margin-bottom:12px;">
         <div class="avatar-big" id="login-emoji">😎</div>
       </div>
       <div class="emoji-picker" id="emoji-picker"></div>
-      <div class="section-label" style="margin-top:4px;">Tu nombre</div>
+
+      <div class="section-label">Tu nombre</div>
       <input type="text" id="inp-name" placeholder="¿Cómo te llamas?" maxlength="20"
         onkeydown="if(event.key==='Enter') loginContinue()">
     </div>
+
     <button class="btn-main" onclick="loginContinue()">CONTINUAR →</button>
   </div>
 </div>
 
 <!-- ═══ LOBBY CHOICE ══════════════════════════ -->
 <div id="screen-lobby-choice" class="screen">
-  <div style="max-width:420px;margin:0 auto;padding:24px 20px;">
-    <button class="btn-back" onclick="backToLogin()">← Volver</button>
-    <div style="text-align:center;padding-top:20px;">
-      <div class="logo-big" style="font-size:clamp(50px,12vw,90px)">STOP!</div>
-      <div class="logo-sub" style="margin-bottom:24px;">¿Qué quieres hacer?</div>
-      <div id="lobby-user-pill" class="user-pill" style="margin-bottom:24px;"></div>
-      <button class="btn-main" onclick="goCreateRoom()">🎲 CREAR SALA</button>
-      <div style="height:10px"></div>
-      <button class="btn-sec" onclick="goJoinRoom()">🔗 UNIRSE A SALA</button>
-    </div>
+  <div style="max-width:420px;margin:0 auto;padding:60px 20px;text-align:center;">
+    <div class="logo-big" style="font-size:clamp(50px,12vw,90px)">STOP!</div>
+    <div class="logo-sub" style="margin-bottom:32px;">¿Qué quieres hacer?</div>
+
+    <div id="lobby-user-pill" class="user-pill"></div>
+
+    <button class="btn-main" onclick="goCreateRoom()">🎲 CREAR SALA</button>
+    <div style="height:10px"></div>
+    <button class="btn-sec" onclick="goJoinRoom()">🔗 UNIRSE A SALA</button>
   </div>
 </div>
 
@@ -1990,8 +1413,10 @@ body.dark .cfg-section-title { color:var(--red); }
 <div id="screen-create" class="screen">
   <div style="max-width:620px;margin:0 auto;padding:24px 20px;">
     <button class="btn-back" onclick="backToChoice()">← Volver</button>
+
     <div class="logo-big" style="font-size:50px;text-align:center;">CREAR SALA</div>
     <div style="height:20px"></div>
+
     <div class="card">
       <div class="section-label">🗂️ Categorías</div>
       <div class="cats-grid" id="create-cat-grid"></div>
@@ -2001,6 +1426,7 @@ body.dark .cfg-section-title { color:var(--red); }
         <button class="btn-add-cat" onclick="addCustomCatCreate()">+ Agregar</button>
       </div>
     </div>
+
     <div class="card">
       <div class="section-label">🔄 Rondas</div>
       <div class="rounds-row">
@@ -2011,6 +1437,7 @@ body.dark .cfg-section-title { color:var(--red); }
         <button class="round-opt" data-n="10" onclick="selectRounds(10,this)">10</button>
       </div>
     </div>
+
     <button class="btn-main" id="btn-create-room" onclick="createRoom()">🎲 CREAR SALA</button>
   </div>
 </div>
@@ -2021,31 +1448,35 @@ body.dark .cfg-section-title { color:var(--red); }
     <button class="btn-back" onclick="backToChoice()">← Volver</button>
     <div class="logo-big" style="font-size:60px;">UNIRSE</div>
     <div class="logo-sub" style="margin-bottom:32px;">Ingresa el código de sala</div>
+
     <input type="text" id="inp-room-code" class="code-input" placeholder="XXXXX"
       maxlength="5" autocapitalize="characters" spellcheck="false"
       oninput="this.value=this.value.toUpperCase()"
       onkeydown="if(event.key==='Enter') joinRoom()">
+
     <button class="btn-main" id="btn-join" onclick="joinRoom()" style="margin-top:12px">UNIRSE →</button>
   </div>
 </div>
 
 <!-- ═══ WAITING ROOM ══════════════════════════ -->
 <div id="screen-waiting" class="screen">
-  <div style="max-width:500px;margin:0 auto;padding:34px 20px;text-align:center;">
+  <div style="max-width:500px;margin:0 auto;padding:30px 20px;text-align:center;">
     <div class="room-share-hint">Código de sala</div>
     <div class="room-code-big" id="room-code-display">-----</div>
     <div class="room-info-badge" id="room-round-info">3 rondas · 6 categorías</div>
+
     <div class="card" style="text-align:left;">
       <div class="section-label">👥 Jugadores conectados</div>
       <div class="waiting-players" id="waiting-players"></div>
     </div>
-    <p id="waiting-hint" style="color:var(--muted);font-size:13px;font-weight:700;margin-bottom:14px;">
+
+    <p class="waiting-hint" id="waiting-hint" style="color:var(--muted);font-size:13px;font-weight:700;margin-bottom:14px;">
       ⏳ Esperando que el anfitrión inicie el juego...
     </p>
-    <button class="btn-main" id="btn-start-game" onclick="startGameFromHost()" style="display:none">▶ INICIAR JUEGO</button>
-    <div style="display:flex;justify-content:center;margin-top:8px;">
-      <button class="btn-back" onclick="leaveRoom()">← Volver</button>
-    </div>
+
+    <button class="btn-main" id="btn-start-game" onclick="startGameFromHost()" style="display:none">
+      ▶ INICIAR JUEGO
+    </button>
   </div>
 </div>
 
@@ -2064,30 +1495,21 @@ body.dark .cfg-section-title { color:var(--red); }
 
 <!-- ═══ PLAYING SCREEN ════════════════════════ -->
 <div id="screen-playing" class="screen">
-  <div style="max-width:700px;margin:0 auto;padding:14px 14px 90px;">
+  <div style="max-width:700px;margin:0 auto;padding:14px 14px 80px;">
+
     <div class="play-top">
-      <div class="play-top-left">
+      <div style="display:flex;align-items:center;gap:14px;">
         <div class="play-letter-big" id="play-letter">A</div>
         <div>
           <div style="font-size:10px;letter-spacing:3px;color:var(--muted);font-weight:900;text-transform:uppercase;">Ronda</div>
           <div style="font-size:17px;font-weight:900;color:var(--text);" id="play-round">1 / 3</div>
         </div>
       </div>
-      <div class="play-top-right">
-        <div class="play-meta-col">
-          <button
-            class="btn-leave-room-top"
-            data-leave-room-btn
-            onclick="leaveRoom()"
-            aria-label="Salir de sala"
-            title="Salir de sala"
-          >⌂</button>
-          <div class="room-code-badge" id="play-room-code">----</div>
-        </div>
-        <div class="score-badge">
-          <div class="score-label">Tus puntos</div>
-          <div class="score-val" id="my-score-display">0</div>
-        </div>
+
+      <!-- Score replaces timer -->
+      <div class="my-score-badge">
+        <div class="my-score-label">Tu puntaje</div>
+        <div class="my-score-val" id="my-score-display">0 pts</div>
       </div>
     </div>
 
@@ -2097,7 +1519,7 @@ body.dark .cfg-section-title { color:var(--red); }
       🛑 <span id="stop-banner-name">¡STOP!</span>
     </div>
 
-    <div class="board-wrap" id="board-wrap">
+    <div class="board-wrap">
       <div class="board-head">
         <div class="board-me-av" id="board-me-emoji">😎</div>
         <div class="board-me-nm" id="board-me-name">Jugador</div>
@@ -2107,7 +1529,9 @@ body.dark .cfg-section-title { color:var(--red); }
 
     <div class="action-row">
       <button class="btn-stop" id="btn-stop" onclick="callStop()">🛑 ¡STOP!</button>
+      <button class="btn-save" id="btn-submit" onclick="submitAnswers()">💾 Guardar</button>
     </div>
+
   </div>
 </div>
 
@@ -2115,336 +1539,49 @@ body.dark .cfg-section-title { color:var(--red); }
 <div id="screen-scoring" class="screen">
   <div style="max-width:900px;margin:0 auto;padding:20px;">
     <div class="scoring-hdl" id="scoring-round-lbl">RONDA 1 — PUNTUACIÓN</div>
-    <div class="scoring-sub" id="scoring-sub">✏️ El anfitrión corrige los puntajes</div>
-
-    <!-- Scroll wrapper only around the table -->
-    <div class="scoring-scroll-wrap">
+    <div class="scoring-subtitle" id="scoring-subtitle">✏️ Corriges las respuestas de tus rivales — ellos corrigen las tuyas</div>
+    <div style="overflow-x:auto;margin-bottom:4px;">
       <div id="scoring-table" style="min-width:400px;"></div>
     </div>
-
-    <div class="scoring-note">
-      ✅ 100 pts — Válida única &nbsp;·&nbsp; 🟡 50 pts — Repetida x2 &nbsp;·&nbsp; 🟠 25 pts — Repetida x3+ &nbsp;·&nbsp; ❌ 0 pts — Inválida/incompleta · Puedes corregir cualquier campo
+    <div id="scoring-rules" style="font-size:11px;color:var(--muted);padding:10px 4px;font-weight:700;">
+      🟢 100 pts — Única · 🟡 50 pts — Repetida x2 · 🟠 25 pts — Repetida x3+ · 🔴 0 pts — Inválida
     </div>
-    <div id="ready-count-info" class="ready-count-badge" style="display:none"></div>
     <button class="btn-next" id="btn-next" onclick="nextRound()" style="display:none">SIGUIENTE RONDA →</button>
-    <button class="btn-ready-next" id="btn-ready-next" onclick="markReadyForNext()" style="display:none">✅ LISTO — He visto mis puntajes</button>
     <div class="waiting-next" id="waiting-next" style="display:none">⏳ Esperando que el anfitrión confirme los puntajes...</div>
   </div>
 </div>
 
 <!-- ═══ RESULTS SCREEN ════════════════════════ -->
 <div id="screen-results" class="screen">
-  <div style="max-width:600px;margin:0 auto;padding:34px 20px;text-align:center;">
-    <span class="winner-crown">🏆</span>
-    <div class="winner-banner-txt">¡CAMPEÓN!</div>
+  <div style="max-width:600px;margin:0 auto;padding:30px 20px;text-align:center;">
+    <div class="winner-banner-txt">🏆 ¡CAMPEÓN!</div>
     <span class="winner-emoji-big" id="winner-emoji">🦁</span>
     <div class="winner-name-big" id="winner-name">NOMBRE</div>
-    <div class="winner-score-lbl" id="winner-score-lbl">0 puntos</div>
-    <div class="winner-msg" id="winner-msg"></div>
+    <div class="winner-score-sub" id="winner-score">0 puntos</div>
+    <div class="winner-message" id="winner-message"></div>
+
     <div class="podium" id="podium"></div>
+
     <div class="leaderboard" id="leaderboard"></div>
+
     <button class="btn-main" id="btn-play-again" onclick="playAgain()" style="display:none">🔄 JUGAR DE NUEVO</button>
     <div class="play-again-hint" id="play-again-hint" style="display:none">⏳ El anfitrión decidirá si jugar de nuevo.</div>
   </div>
 </div>
 
 <script>
+// Update lobby user pill
 const observer = new MutationObserver(() => {
   if (document.getElementById('screen-lobby-choice')?.classList.contains('active')) {
     const pill = document.getElementById('lobby-user-pill');
-    if (pill && window.me) pill.innerHTML = `<span>${window.me.emoji}</span> ${window.me.name}`;
+    if (pill && window.me) {
+      pill.innerHTML = `<span>${window.me.emoji}</span> ${window.me.name}`;
+    }
   }
 });
 observer.observe(document.body, { attributes:true, subtree:true, attributeFilter:['class'] });
 </script>
 
-<!-- ═══ CONFIG BUTTON (all screens) ════════ -->
-<button class="cfg-btn" onclick="openConfig()" title="Configuración">⚙️</button>
-
-<script>
-// ── TRANSLATIONS ──────────────────────────
-const LANGS = {
-  es: {
-    configTitle: 'Configuración', theme: 'Tema', themeLight: '☀️ Claro', themeDark: '🌙 Oscuro',
-    language: 'Idioma', close: 'CERRAR',
-    avatarLabel: 'Tu avatar', nameLabel: 'Tu nombre', namePlaceholder: '¿Cómo te llamas?',
-    continueBtn: 'CONTINUAR →', multiplayerSub: 'Multijugador en red',
-    whatToDo: '¿Qué quieres hacer?', createRoomBtn: '🎲 CREAR SALA', joinRoomBtn: '🔗 UNIRSE A SALA',
-    back: '← Volver', createTitle: 'CREAR SALA', catsLabel: '🗂️ Categorías',
-    catPlaceholder: 'Categoría personalizada...', addCat: '+ Agregar', roundsLabel: '🔄 Rondas',
-    createBtn: '🎲 CREAR SALA', joinTitle: 'UNIRSE', joinSub: 'Ingresa el código de sala',
-    joinBtn: 'UNIRSE →', codeLabel: 'Código de sala', playersLabel: '👥 Jugadores conectados',
-    waitingHint: '⏳ Esperando que el anfitrión inicie el juego...', startBtn: '▶ INICIAR JUEGO',
-    readyBtn: '¡ESTOY LISTO! →', readyHint: 'Todos deben presionar listo para comenzar',
-    roundLabel: 'Ronda', scoreLabel: 'Tus puntos', stopBtn: '🛑 ¡STOP!',
-    scoringNote: '✅ 100 pts — Válida única · 🟡 50 pts — Repetida x2 · 🟠 25 pts — Repetida x3+ · ❌ 0 pts — Inválida/incompleta · Puedes corregir cualquier campo',
-    nextBtn: 'SIGUIENTE RONDA →', finalBtn: '🏆 VER RESULTADOS FINALES',
-    readyNextBtn: '✅ LISTO — He visto mis puntajes', readyNextWait: '✅ LISTO — Esperando al anfitrión...',
-    waitingHost: '⏳ Esperando que el anfitrión confirme los puntajes...',
-    champion: '¡CAMPEÓN!', playAgain: '🔄 JUGAR DE NUEVO',
-    playAgainHint: '⏳ El anfitrión decidirá si jugar de nuevo.',
-    hostBadge: '👑 Host', youTag: '(tú)', creatingRoom: 'Creando sala...', searching: 'Buscando...',
-    roomNotFound: 'Sala no encontrada.', gameStarted: 'El juego ya comenzó y no puedes unirte.',
-    minCats: 'Elige al menos 2 categorías',
-    confirmStop: '¿Seguro que querés cantar STOP ahora? Se activará una cuenta regresiva de 10 segundos para todos.',
-    confirmLeaveHost: t('confirmLeaveHost'),
-    confirmLeaveGuest: t('confirmLeaveGuest'),
-    stopActive: '🛑 STOP ya activo', stopSending: '⏳ Enviando...',
-    closingRound: t('closingRound'), closingIn: ' · Cierra en ',
-    calcScores: '⏳ Calculando puntajes automáticos...',
-    savingAnswers: '⏳ Guardando respuestas de todos...',
-    hostSubtitle: '✏️ Todos pueden corregir puntajes · Tú decides cuándo avanzar',
-    guestSubtitle: '✏️ Corrige los puntajes · Pulsa LISTO cuando termines',
-    waitingPlayers: '⏳ Esperando jugadores',
-    guestsReady: '👥 invitados listos', roundOf: 'de', scoringTitle: 'PUNTUACIÓN',
-    validUnique: '✅ 100 — Válida única', repeated2: '🟡 50 — Repetida x2',
-    repeated3: '🟠 25 — Repetida x3+', invalid: '❌ 0 — Inválida',
-    catHeader: 'Categoría', thisRound: 'ESTA RONDA', accumulated: 'ACUMULADO',
-    youLabel: '(tú) ✏️', editLabel: '✏️ editar',
-    congrats: '🎉 ¡Felicidades, ganaste esta partida!',
-    wellPlayed: '¡Bien jugado!', bestThisTime: 'fue el mejor esta vez.',
-    points: 'puntos', roomCodeLabel: 'Sala',
-    // Default category names
-    catNombre: 'Nombre', catPais: 'País', catAnimal: 'Animal', catColor: 'Color',
-    catFruta: 'Fruta', catCosa: 'Cosa', catArtista: 'Artista', catPelicula: 'Película',
-    catComida: 'Comida', catDeporte: 'Deporte', catMarca: 'Marca', catProfesion: 'Profesión',
-    // Exit messages
-    roomClosed: 'La sala fue cerrada. Puedes crear o unirte a una nueva sala.',
-    roomNoHost: 'La sala quedó sin anfitrión. Volviste al inicio.',
-    roomNotExist: 'La sala ya no existe.',
-    roomKicked: 'Ya no formas parte de esta sala.',
-    hostDisconnected: 'El anfitrión se desconectó. La sala se cerró.',
-    joinError: 'Error al unirse. Intenta de nuevo.',
-  },
-  en: {
-    configTitle: 'Settings', theme: 'Theme', themeLight: '☀️ Light', themeDark: '🌙 Dark',
-    language: 'Language', close: 'CLOSE',
-    avatarLabel: 'Your avatar', nameLabel: 'Your name', namePlaceholder: 'What is your name?',
-    continueBtn: 'CONTINUE →', multiplayerSub: 'Online multiplayer',
-    whatToDo: 'What do you want to do?', createRoomBtn: '🎲 CREATE ROOM', joinRoomBtn: '🔗 JOIN ROOM',
-    back: '← Back', createTitle: 'CREATE ROOM', catsLabel: '🗂️ Categories',
-    catPlaceholder: 'Custom category...', addCat: '+ Add', roundsLabel: '🔄 Rounds',
-    createBtn: '🎲 CREATE ROOM', joinTitle: 'JOIN', joinSub: 'Enter the room code',
-    joinBtn: 'JOIN →', codeLabel: 'Room code', playersLabel: '👥 Connected players',
-    waitingHint: '⏳ Waiting for the host to start the game...', startBtn: '▶ START GAME',
-    readyBtn: "I'M READY! →", readyHint: 'Everyone must press ready to begin',
-    roundLabel: 'Round', scoreLabel: 'Your score', stopBtn: '🛑 STOP!',
-    scoringNote: '✅ 100 pts — Unique valid · 🟡 50 pts — Repeated x2 · 🟠 25 pts — Repeated x3+ · ❌ 0 pts — Invalid · Anyone can edit a field',
-    nextBtn: 'NEXT ROUND →', finalBtn: '🏆 SEE FINAL RESULTS',
-    readyNextBtn: '✅ DONE — I reviewed my scores', readyNextWait: '✅ DONE — Waiting for host...',
-    waitingHost: '⏳ Waiting for the host to confirm scores...',
-    champion: 'CHAMPION!', playAgain: '🔄 PLAY AGAIN',
-    playAgainHint: '⏳ The host will decide whether to play again.',
-    hostBadge: '👑 Host', youTag: '(you)', creatingRoom: 'Creating room...', searching: 'Searching...',
-    roomNotFound: 'Room not found.', gameStarted: 'The game already started, you cannot join.',
-    minCats: 'Choose at least 2 categories',
-    confirmStop: 'Are you sure you want to call STOP now? A 10-second countdown will start for everyone.',
-    confirmLeaveHost: 'You will close the room for everyone. Are you sure you want to leave?',
-    confirmLeaveGuest: 'Are you sure you want to leave the room?',
-    stopActive: '🛑 STOP already active', stopSending: '⏳ Sending...',
-    closingRound: ' · Closing round...', closingIn: ' · Closes in ',
-    calcScores: '⏳ Calculating automatic scores...',
-    savingAnswers: '⏳ Saving everyone\'s answers...',
-    hostSubtitle: '✏️ Everyone can edit scores · You decide when to advance',
-    guestSubtitle: '✏️ Edit the scores · Press DONE when finished',
-    waitingPlayers: '⏳ Waiting for players',
-    guestsReady: '👥 guests ready', roundOf: 'of', scoringTitle: 'SCORING',
-    validUnique: '✅ 100 — Unique valid', repeated2: '🟡 50 — Repeated x2',
-    repeated3: '🟠 25 — Repeated x3+', invalid: '❌ 0 — Invalid',
-    catHeader: 'Category', thisRound: 'THIS ROUND', accumulated: 'TOTAL',
-    youLabel: '(you) ✏️', editLabel: '✏️ edit',
-    congrats: '🎉 Congratulations, you won!',
-    wellPlayed: 'Well played!', bestThisTime: 'was the best this time.',
-    points: 'points', roomCodeLabel: 'Room',
-    catNombre: 'Name', catPais: 'Country', catAnimal: 'Animal', catColor: 'Color',
-    catFruta: 'Fruit', catCosa: 'Thing', catArtista: 'Artist', catPelicula: 'Movie',
-    catComida: 'Food', catDeporte: 'Sport', catMarca: 'Brand', catProfesion: 'Profession',
-    // Exit messages
-    roomClosed: 'The room was closed. You can create or join a new room.',
-    roomNoHost: 'The room has no host. You have been returned to the lobby.',
-    roomNotExist: 'The room no longer exists.',
-    roomKicked: 'You are no longer part of this room.',
-    hostDisconnected: 'The host disconnected. The room was closed.',
-    joinError: 'Error joining room. Please try again.',
-  }
-};
-
-let _currentLang = localStorage.getItem('stop_lang') || 'es';
-let _currentTheme = localStorage.getItem('stop_theme') || 'light';
-
-function t(key) {
-  return LANGS[_currentLang]?.[key] || LANGS['es'][key] || key;
-}
-
-function applyTheme() {
-  document.body.classList.toggle('dark', _currentTheme === 'dark');
-}
-
-function applyLang() {
-  // Helper: set text only if element exists and (if a button) not currently disabled/loading
-  function setText(sel, key) {
-    const el = document.querySelector(sel);
-    if (!el) return;
-    if (el.tagName === 'BUTTON' && el.disabled) return;
-    el.textContent = t(key);
-  }
-
-  // Screens - static labels
-  setText('#screen-login .logo-sub',           'multiplayerSub');
-  setText('#screen-login .section-label',      'avatarLabel');
-  setText('#screen-lobby-choice .logo-sub',    'whatToDo');
-  setText('#btn-create-room',                  'createBtn');
-  setText('#btn-join',                         'joinBtn');
-  setText('#btn-start-game',                   'startBtn');
-  setText('#btn-ready',                        'readyBtn');
-  setText('#btn-stop',                         'stopBtn');
-  setText('#btn-play-again',                   'playAgain');
-  setText('#waiting-hint',                     'waitingHint');
-  setText('#play-again-hint',                  'playAgainHint');
-  setText('.winner-banner-txt',                'champion');
-  setText('.scoring-note',                     'scoringNote');
-
-  // Lobby choice buttons
-  const lobbyBtns = document.querySelectorAll('#screen-lobby-choice .btn-main, #screen-lobby-choice .btn-sec');
-  if (lobbyBtns[0]) lobbyBtns[0].textContent = t('createRoomBtn');
-  if (lobbyBtns[1]) lobbyBtns[1].textContent = t('joinRoomBtn');
-
-  // Continue button (login)
-  const contBtn = document.querySelector('#screen-login .btn-main');
-  if (contBtn && !contBtn.disabled) contBtn.textContent = t('continueBtn');
-
-  // Join screen subtitle
-  const joinSub = document.querySelector('#screen-join .logo-sub');
-  if (joinSub) joinSub.textContent = t('joinSub');
-
-  // Join title
-  const joinTitle = document.querySelector('#screen-join .logo-big');
-  if (joinTitle) joinTitle.textContent = t('joinTitle');
-
-  // Create title
-  const createTitle = document.querySelector('#screen-create .logo-big');
-  if (createTitle) createTitle.textContent = t('createTitle');
-
-  // Waiting room code label
-  const codeLabel = document.querySelector('.room-share-hint');
-  if (codeLabel) codeLabel.textContent = t('codeLabel');
-
-  // Ready screen hint
-  const readyHintEl = document.querySelector('#screen-letter p');
-  if (readyHintEl) readyHintEl.textContent = t('readyHint');
-
-  // Round label in playing screen
-  const roundLbl = document.querySelector('#screen-playing .play-top-left > div > div:first-child');
-  if (roundLbl) roundLbl.textContent = t('roundLabel');
-
-  // Score label
-  const sl = document.querySelector('.score-label');
-  if (sl) sl.textContent = t('scoreLabel');
-
-  // Section labels with data-i18n
-  document.querySelectorAll('[data-i18n]').forEach(el => {
-    el.textContent = t(el.dataset.i18n);
-  });
-
-  // Section labels in create screen (the .section-label divs)
-  const sectionLabels = document.querySelectorAll('#screen-create .section-label');
-  if (sectionLabels[0]) sectionLabels[0].textContent = t('catsLabel');
-  if (sectionLabels[1]) sectionLabels[1].textContent = t('roundsLabel');
-
-  // Players label in waiting screen
-  const playersLbl = document.querySelector('#screen-waiting .section-label');
-  if (playersLbl) playersLbl.textContent = t('playersLabel');
-
-  // Add cat button
-  const addCatBtn = document.querySelector('.btn-add-cat');
-  if (addCatBtn) addCatBtn.textContent = t('addCat');
-
-  // Placeholders
-  const nameInp = document.getElementById('inp-name');
-  if (nameInp) nameInp.placeholder = t('namePlaceholder');
-  const catInp = document.getElementById('inp-custom-cat');
-  if (catInp) catInp.placeholder = t('catPlaceholder');
-
-  // Back buttons
-  document.querySelectorAll('.btn-back').forEach(btn => {
-    btn.textContent = t('back');
-  });
-}
-
-function openConfig() {
-  const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
-  overlay.innerHTML = `
-    <div class="modal-box" style="max-width:340px;text-align:left;">
-      <div style="text-align:center;font-size:28px;margin-bottom:4px;">⚙️</div>
-      <div style="text-align:center;font-family:'Bebas Neue',sans-serif;font-size:26px;letter-spacing:3px;color:var(--text);margin-bottom:2px;">${t('configTitle')}</div>
-
-      <div class="cfg-section-title">${t('theme')}</div>
-      <div class="cfg-options-row">
-        <button class="cfg-opt-btn ${_currentTheme==='light'?'active':''}" id="cfg-light" onclick="setTheme('light')">
-          <span class="cfg-icon">☀️</span>${t('themeLight').replace('☀️ ','')}
-        </button>
-        <button class="cfg-opt-btn ${_currentTheme==='dark'?'active':''}" id="cfg-dark" onclick="setTheme('dark')">
-          <span class="cfg-icon">🌙</span>${t('themeDark').replace('🌙 ','')}
-        </button>
-      </div>
-
-      <div class="cfg-section-title">${t('language')}</div>
-      <div class="cfg-options-row">
-        <button class="cfg-opt-btn ${_currentLang==='es'?'active':''}" id="cfg-es" onclick="setLang('es')">
-          <span class="cfg-icon">🇪🇸</span>Español
-        </button>
-        <button class="cfg-opt-btn ${_currentLang==='en'?'active':''}" id="cfg-en" onclick="setLang('en')">
-          <span class="cfg-icon">🇬🇧</span>English
-        </button>
-      </div>
-
-      <hr class="cfg-divider">
-      <button class="modal-btn modal-btn-primary" style="margin-top:16px;width:100%;" onclick="closeConfig(this)">${t('close')}</button>
-    </div>`;
-  overlay.id = 'cfg-modal';
-  document.body.appendChild(overlay);
-  requestAnimationFrame(() => overlay.classList.add('modal-visible'));
-  overlay.addEventListener('click', e => { if (e.target === overlay) closeConfig(); });
-}
-
-window.setTheme = function(theme) {
-  _currentTheme = theme;
-  localStorage.setItem('stop_theme', theme);
-  applyTheme();
-  // Update active states in modal
-  document.getElementById('cfg-light')?.classList.toggle('active', theme === 'light');
-  document.getElementById('cfg-dark')?.classList.toggle('active', theme === 'dark');
-};
-
-window.setLang = function(lang) {
-  _currentLang = lang;
-  localStorage.setItem('stop_lang', lang);
-  applyLang();
-  // Update active states in modal
-  document.getElementById('cfg-es')?.classList.toggle('active', lang === 'es');
-  document.getElementById('cfg-en')?.classList.toggle('active', lang === 'en');
-  // Update close button text
-  const closeBtn = document.querySelector('#cfg-modal .modal-btn-primary');
-  if (closeBtn) closeBtn.textContent = t('close');
-  // Update section titles
-  document.querySelectorAll('#cfg-modal .cfg-section-title').forEach((el, i) => {
-    el.textContent = [t('theme'), t('language')][i] || el.textContent;
-  });
-};
-
-window.closeConfig = function() {
-  const overlay = document.getElementById('cfg-modal');
-  if (!overlay) return;
-  overlay.classList.remove('modal-visible');
-  setTimeout(() => overlay.remove(), 220);
-};
-
-window.openConfig = openConfig;
-
-// Init on load
-applyTheme();
-applyLang();
-</script>
 </body>
 </html>
+
